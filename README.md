@@ -1,0 +1,312 @@
+# DarkFlash Space Station for Linux
+
+Native Linux control for the 320×320 darkFlash Space Station cooler display
+(`darkFlash Inc.`, USB `1d6b:0102`). It replaces the display-control portion of
+DF Space Station with a command-line tool and a GTK 4 / Libadwaita desktop app.
+
+This is an independent community project based on behavior observed from the
+hardware and vendor application. It is not affiliated with or endorsed by
+DarkFlash.
+
+> **One writer only:** do not run this project and the Windows DF Space Station
+> application at the same time. The display accepts only one active HID writer.
+
+## Features
+
+- Device status, wake/resume, and the observed sleep-timeout command.
+- Center-cropped still images as foreground `.osd` media.
+- GIFs as 320×320 H.264 MP4 background media, decoded and looped by the cooler
+  at 20 FPS.
+- Transparent foreground OSD uploads that clear a previous static image and
+  expose the video background.
+- Native CPU/GPU stock-theme telemetry, including a 5-second rolling average
+  for CPU package temperature.
+- A visual telemetry-layout editor with text widgets and six graph styles.
+- Optional GIF color masking and synchronization with an OpenRGB LED.
+- A managed user service for a persistent telemetry overlay.
+
+The firmware has separate background-video and foreground-OSD layers. A GIF
+upload always sends the MP4 background followed by a transparent OSD. A still
+image is an OSD upload and will cover a video until `media clear-overlay` runs.
+
+Brightness and rotation are reported by `status` but intentionally remain
+read-only: their firmware write commands have not been captured yet, so this
+project does not guess at HID operations.
+
+## Requirements
+
+- Python 3.11+
+- ImageMagick (`convert`) and Fontconfig (`fc-list`) for media and overlays
+- FFmpeg with `libx264` for GIF conversion
+- `lm_sensors` (`sensors -j`) for CPU temperatures
+- GTK 4, Libadwaita, and PyGObject for the optional GUI
+- A udev rule granting the desktop user read/write access to the cooler's
+  `hidraw` device
+
+Package names vary by distribution. On Arch Linux, the runtime dependencies
+are available as:
+
+```bash
+sudo pacman -S python imagemagick ffmpeg lm_sensors gtk4 libadwaita python-gobject
+```
+
+OpenRGB is optional and is needed only for LED-derived GIF masking.
+
+## Device permissions
+
+Create a narrow udev rule for the observed USB device instead of making all
+`hidraw` devices writable:
+
+```bash
+sudo tee /etc/udev/rules.d/70-darkflash-space-station.rules >/dev/null <<'EOF'
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1d6b", ATTRS{idProduct}=="0102", TAG+="uaccess"
+EOF
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Disconnect and reconnect the cooler after installing the rule. Confirm that
+the device is detected and accessible with:
+
+```bash
+darkflash-space-station status
+```
+
+If your hardware reports a different USB ID, do not broaden the rule. Open an
+issue with the output of `lsusb` and the device name shown by
+`udevadm info /dev/hidrawN` so support can be added explicitly.
+
+## Installation
+
+Clone the repository and create an editable virtual environment:
+
+```bash
+git clone https://github.com/brentmakesapps/dark-flash-space-station-linux.git
+cd dark-flash-space-station-linux
+python -m venv --system-site-packages .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/pytest -q
+```
+
+`--system-site-packages` is required because Arch provides PyGObject as a system
+package. Activate the environment or prefix commands with `.venv/bin/`:
+
+```bash
+source .venv/bin/activate
+darkflash-space-station status
+```
+
+## Command-line usage
+
+```bash
+# Query firmware, free media space, brightness, rotation, timeout, and mode.
+darkflash-space-station status
+
+# Resume the display and set its sleep timeout.
+darkflash-space-station wake --timeout 60
+darkflash-space-station display timeout 0
+
+# Show a static foreground image.
+darkflash-space-station media image ~/Downloads/hack-the-planet.jpg
+
+# Upload a GIF once as a looping 20-FPS H.264 background.
+darkflash-space-station media gif ~/Downloads/elmo-fire.gif
+
+# Remove the foreground OSD to reveal the current video background.
+darkflash-space-station media clear-overlay
+
+# Send stock-theme state data, or render CPU/GPU values over the current video.
+darkflash-space-station telemetry --once
+darkflash-space-station telemetry --overlay --once
+darkflash-space-station telemetry --overlay --layout Gaming
+darkflash-space-station telemetry --overlay --temperature-unit F --once
+darkflash-space-station telemetry --gpu-bdf 0000:04:00.0 --interval 1
+```
+
+Run `darkflash-space-station --help` or append `--help` to any subcommand for
+the complete argument reference. The CLI defaults to GPU PCI address
+`0000:04:00.0`; pass `--gpu-bdf` when the intended GPU uses another address.
+When that address is absent, GPU telemetry is reported as unavailable rather
+than silently selecting another card.
+
+## GTK desktop app
+
+Launch either command:
+
+```bash
+darkflash-space-station gui
+darkflash-space-station-gui
+```
+
+To add **darkFlash Space Station** to the application launcher, make the GUI
+entry point available on `PATH` and install the supplied desktop entry:
+
+```bash
+mkdir -p ~/.local/bin ~/.local/share/applications
+ln -sf "$PWD/.venv/bin/darkflash-space-station-gui" \
+  ~/.local/bin/darkflash-space-station-gui
+install -m644 darkflash-space-station.desktop \
+  ~/.local/share/applications/darkflash-space-station.desktop
+```
+
+The app provides:
+
+- **Device:** status refresh and wake.
+- **Media:** still-image selection, GIF/video upload, and overlay clearing.
+  GIF uploads can leave source colors unchanged, apply a manual luminance mask,
+  or use the current first LED color from OpenRGB's `ARGB_V2_3` zone. OpenRGB
+  masking requires its local SDK server (`openrgb --server`) to be running.
+  **Sync GIF with OpenRGB** polls that LED every three seconds and re-uploads
+  the most recently uploaded OpenRGB-masked GIF after the new color is stable
+  for one additional poll. Stop the telemetry background service first because
+  the cooler allows only one active HID writer.
+- **Display:** sleep timeout configuration.
+- **Native telemetry:** friendly detected-GPU dropdown (for example, Intel Arc
+  Pro B50), persisted Celsius/Fahrenheit selector, transparent CPU/GPU overlay,
+  one-shot update, and start/stop stream. Temperatures use a degree symbol
+  (for example, `34°C` or `93°F`).
+- **Telemetry layout:** named 320×320 layouts with an explicit **Save layout**
+  button and a **Reset layout** option. Edits remain in memory until saved;
+  Reset discards all pending layout edits and restores the selected saved
+  layout. Switching layouts keeps pending edits available and the active layout
+  is updated on save. Layouts support
+  draggable CPU/GPU temperature and load, network upload/download, time, date,
+  and custom-text widgets, plus per-widget font, size, and color controls.
+  Selecting a widget reveals a lower-right resize handle: drag it to resize a
+  text widget's font or a graph's width and height. Moving or resizing shows a
+  translucent outline of the final position or size before the edit is applied.
+  The font selector previews each installed family in its own typeface; choosing
+  one updates the live layout preview immediately, while hovering or using
+  Up/Down previews a candidate without changing the saved widget font.
+  The preview includes 40-pixel grid lines to help align widgets. Enable
+  **Snap to grid** to align moved widgets and resized graphs to those lines.
+  Telemetry output is inset 24 pixels from the cooler panel's top and left
+  edges to align the device's OSD coordinate origin with the preview.
+  The **Add** menu also offers bar, line, circular-line, semicircle-gauge,
+  ring-gauge, and pie graphs for every CPU/GPU temperature/load and
+  network-throughput metric. Semicircle gauges show the latest value as a
+  progress arc; ring gauges show the full ring using the selected color at
+  50% opacity. The other graph types use a rolling history window (default:
+  60 seconds). Circular-line, gauge, and pie graphs keep a 1:1 aspect ratio.
+  Each graph's color, width, height, history duration, and position are saved
+  in the layout JSON.
+
+Errors appear as in-app notifications. The app serializes every HID write. Stop
+the telemetry stream before switching media so a foreground action is not
+waiting for the stream to release the device.
+
+Saved layouts are stored in
+`~/.config/darkflash-space-station/layouts.json`. The selected GUI layout is
+used for both one-shot and continuous GUI telemetry overlays. Saving a layout
+also writes it as the active layout in
+`~/.config/darkflash-space-station/active-layout`; `telemetry --overlay` uses
+that saved active layout by default. Use `--layout NAME` to run a different
+saved layout without changing the active one.
+Graph entries use the same metric names as text widgets and add
+`graph_style`, `width`, `height`, and `history_seconds` fields. Missing
+`history_seconds` values default to 60 seconds, so existing layout files remain
+compatible and can be edited or backed up as JSON.
+
+The GUI also saves its selected GPU, telemetry refresh interval, display sleep
+timeout, temperature unit, and currently selected layout in
+`~/.config/darkflash-space-station/settings.json`. These preferences are saved
+when changed and are separate from editable layout data: widget/layout edits
+still require **Save layout**.
+
+## One writer at a time
+
+The cooler supports only one active HID writer. Do not run the Wine DF Space
+Station app, the installed telemetry service, and this CLI/GUI concurrently.
+Close or stop the other writer before a direct media or display operation:
+
+```bash
+systemctl --user stop darkflash-space-station.service
+```
+
+The device can acknowledge invalid or incomplete media transfers while leaving
+the panel unresponsive. If that occurs, disconnect and reconnect the cooler's
+USB connection, then use `media image` or `wake` to restore it.
+
+## Protocol notes
+
+The display uses padded 1,024-byte HID reports. Control messages carry a
+monotonic `SeqNumber`; media transfer uses `POST transport`, raw 1,000-byte
+blocks, and `POST transported`. A transfer's raw-block acknowledgement has
+`AckNumber=0` and is valid.
+
+The display's accepted GIF path is not a host-streamed sequence of PNGs:
+
+1. Convert GIF to a 320×320 H.264 High Profile, YUV420P, 20 FPS MP4.
+2. Keep the video below the device's reported media-space limit (about 78 KB).
+3. Upload it as `.mp4`.
+4. Upload a transparent `.osd` to clear the foreground layer.
+
+The current encoder targets 675 kbps; source GIF complexity and duration still
+determine whether the converted media fits the device.
+
+## Background telemetry-overlay service
+
+The user service continuously renders the active saved telemetry layout as the
+foreground overlay, disables display sleep, and restarts after a failure. It
+does not require root:
+
+```bash
+darkflash-space-station service install
+darkflash-space-station service start
+darkflash-space-station service status
+darkflash-space-station service stop
+```
+
+`service install` safely writes the managed unit to
+`~/.config/systemd/user/` and runs `systemctl --user daemon-reload`; `start`
+also enables the service for future logins. The GTK app exposes the same
+running/stopped status and Start/Stop control under **Native telemetry**.
+
+Stop the service before using foreground CLI or GUI media controls. It is one
+of the possible HID writers described above.
+
+The `service install` command writes a user unit containing the executable path
+of the Python environment that ran the command. Re-run it after moving or
+recreating the virtual environment.
+
+## Troubleshooting
+
+| Symptom | Action |
+| --- | --- |
+| `display was not found on hidraw` | Reconnect the USB cable, verify `lsusb`, and make sure the device reports `1d6b:0102`. |
+| `permission denied opening /dev/hidrawN` | Install the udev rule above, reload the rules, then reconnect the cooler. |
+| `unable to render` or GIF conversion fails | Verify `convert`, `fc-list`, and an FFmpeg build with `libx264` are installed. |
+| CPU temperature is unavailable | Run `sensors -j` and configure the required kernel sensor modules with `sensors-detect`. |
+| OpenRGB masking fails | Start the local SDK server with `openrgb --server` and verify the `ARGB_V2_3` zone exists. |
+| Panel stops responding after media upload | Stop every competing writer, reconnect the cooler, then run `wake` or upload a still image. |
+| Background service repeatedly restarts | Run `darkflash-space-station service status` and inspect `journalctl --user -u darkflash-space-station.service`. |
+
+## Development
+
+Run the test suite from the repository root:
+
+```bash
+.venv/bin/pytest -q
+```
+
+The tests exercise protocol framing and CLI behavior without requiring the
+physical display. Hardware, media-transfer, and telemetry changes should also
+be verified on the target cooler.
+
+## Project layout
+
+| Path | Purpose |
+| --- | --- |
+| `src/darkflash_space_station/protocol.py` | HID message and media-transfer framing |
+| `src/darkflash_space_station/hid.py` | Device discovery and raw HID I/O |
+| `src/darkflash_space_station/controller.py` | High-level display operations |
+| `src/darkflash_space_station/media.py` | Image, video, overlay, and graph rendering |
+| `src/darkflash_space_station/telemetry.py` | CPU, GPU, and network telemetry |
+| `src/darkflash_space_station/layout.py` | Saved telemetry layout model |
+| `src/darkflash_space_station/gui.py` | GTK 4 / Libadwaita application |
+| `src/darkflash_space_station/service.py` | Managed systemd user-service integration |
+| `tests/` | Protocol and CLI tests |
+
+## License
+
+Licensed under the [GNU General Public License v3.0 only](LICENSE).

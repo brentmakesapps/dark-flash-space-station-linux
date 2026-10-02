@@ -1,0 +1,14 @@
+[Unit]
+Description=darkFlash Space Station telemetry overlay
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/darkflash-space-station/service.env
+ExecStart=/usr/bin/env ${DARKFLASH_SPACE_STATION} telemetry --overlay --keep-awake
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

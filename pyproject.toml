@@ -1,0 +1,30 @@
+[project]
+name = "dark-flash-space-station"
+version = "0.1.0"
+description = "Native Linux telemetry sender for darkFlash Space Station cooler displays"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = ["openrgb-python>=0.3,<0.4"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 (GPLv3)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+darkflash-space-station = "darkflash_space_station.cli:main"
+darkflash-space-station-gui = "darkflash_space_station.gui:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

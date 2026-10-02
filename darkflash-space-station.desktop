@@ -1,0 +1,9 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=darkFlash Space Station
+Comment=Control the darkFlash Space Station display
+Exec=darkflash-space-station-gui
+Terminal=false
+Categories=Utility;
+StartupNotify=true
