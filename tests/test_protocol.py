@@ -1,6 +1,16 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import darkflash_space_station.media as media
+from darkflash_space_station.animation import (
+    AdaptiveAnimation,
+    AnimationCache,
+    CACHE_VERSION,
+    SPEED_MULTIPLIERS,
+    StableSpeedSelector,
+    speed_bucket,
+)
+from darkflash_space_station.cli import resolved_layout_media, restore_saved_animation
 from darkflash_space_station.protocol import (
     MEDIA_BLOCK_SIZE,
     REPORT_SIZE,
@@ -15,13 +25,18 @@ from darkflash_space_station.media import (
     _graph_values,
     format_temperature,
     image_magick_font,
+    render_background_image,
+    render_blank_background,
+    render_masked_gif_preview,
     render_telemetry_overlay,
 )
-from darkflash_space_station.controller import _response_json
-from darkflash_space_station.gui import installed_font_families
+from darkflash_space_station.openrgb import adjust_mask_color
+from darkflash_space_station.controller import _response_json, animation_load
+from darkflash_space_station.gui import installed_font_families, restored_gif_sync_state
 from darkflash_space_station.layout import (
     Layout,
     LayoutDraft,
+    LayoutMedia,
     LayoutStore,
     Widget,
     resize_values,
@@ -31,9 +46,12 @@ from darkflash_space_station.layout import (
 from darkflash_space_station.settings import AppSettings, SettingsStore
 from darkflash_space_station.service import unit_text
 from darkflash_space_station.telemetry import (
+    DetectedGpu,
     TelemetryHistory,
     TemperatureAverage,
+    _nvtop_device_for_gpu,
     detected_gpus,
+    state,
 )
 
 
@@ -92,6 +110,114 @@ def test_temperature_average_uses_a_five_second_trailing_window() -> None:
     assert average.add(35) == 40
     now[0] = 5
     assert average.add(50) == 45
+
+
+def test_animation_speed_buckets_cover_ten_percent_ranges() -> None:
+    assert [speed_bucket(load) for load in (0, 10, 11, 20, 21, 90, 91, 100)] == [
+        0,
+        0,
+        1,
+        1,
+        2,
+        8,
+        9,
+        9,
+    ]
+    assert SPEED_MULTIPLIERS[0] == 1
+    assert SPEED_MULTIPLIERS[-1] == 3
+    assert all(
+        left < right
+        for left, right in zip(SPEED_MULTIPLIERS, SPEED_MULTIPLIERS[1:])
+    )
+
+
+def test_max_animation_load_uses_highest_cpu_or_detected_gpu() -> None:
+    payload = {
+        "cpu": {"load": 25},
+        "gpu": {"load": 15},
+        "gpus": {
+            "0000:00:02.0": {"load": 15},
+            "0000:04:00.0": {"load": 100},
+            "0000:85:00.0": {"load": 0},
+        },
+    }
+
+    assert animation_load(payload, "gpu") == 15
+    assert animation_load(payload, "max") == 100
+
+
+def test_mask_color_tuning_rotates_hue_and_scales_brightness() -> None:
+    assert adjust_mask_color("#ff0000", hue_shift=120) == "#00ff00"
+    assert adjust_mask_color("#ff0000", brightness_percent=50) == "#800000"
+    assert adjust_mask_color("#ff0000", brightness_percent=200) == "#ffffff"
+    assert adjust_mask_color("#00ff00", hue_shift=-120, brightness_percent=50) == "#800000"
+
+
+def test_animation_speed_change_requires_five_stable_seconds() -> None:
+    selector = StableSpeedSelector(5)
+
+    assert selector.update(5, 0) == 0
+    assert selector.update(75, 1) is None
+    assert selector.update(75, 5.9) is None
+    assert selector.update(75, 6) == 7
+    assert selector.update(5, 7) is None
+    assert selector.update(75, 8) is None
+
+
+def test_animation_cache_builds_ten_linear_speed_variants(
+    monkeypatch, tmp_path
+) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    source = tmp_path / "background.gif"
+    source.write_bytes(b"gif")
+    calls = []
+    monkeypatch.setattr(
+        "darkflash_space_station.animation.render_animation",
+        lambda selected, color, *, speed: calls.append((selected, color, speed))
+        or str(speed).encode(),
+    )
+
+    cache = AnimationCache(store)
+    cache.rebuild(source, "#ff3c00")
+
+    assert len(calls) == 10
+    assert calls[0] == (source, "#ff3c00", 1)
+    assert calls[-1] == (source, "#ff3c00", 3)
+    assert tuple(call[2] for call in calls) == SPEED_MULTIPLIERS
+    assert cache.variant(0) == b"1.0"
+    assert cache.variant(9) == b"3.0"
+    assert cache.matches("#ff3c00")
+
+
+def test_adaptive_animation_reloads_mask_tuning_changes(
+    monkeypatch, tmp_path
+) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    source = tmp_path / "background.gif"
+    source.write_bytes(b"gif")
+    settings = AppSettings(gif_mask_mode="manual", gif_mask_color="#ff0000")
+    store.save(settings)
+    monkeypatch.setattr(
+        "darkflash_space_station.animation.render_animation",
+        lambda _source, color, *, speed: f"{color}:{speed}".encode(),
+    )
+    animation = AdaptiveAnimation(source, settings, AnimationCache(store))
+    settings.gif_hue_shift = 120
+    store.save(settings)
+
+    assert animation.refresh_color()
+    assert animation.color == "#00ff00"
+    assert animation.variant(0).startswith(b"#00ff00:")
+
+
+def test_matches_gpu_to_nvtop_using_pc_monitor_name_strategy() -> None:
+    gpu = DetectedGpu("0000:04:00.0", "xe", "Intel Arc Pro B70")
+    snapshot = [
+        {"device_name": "Battlemage G31 (Arc Pro B70)", "gpu_util": "75%"},
+        {"device_name": "Battlemage G21 (Arc Pro B50)", "gpu_util": "25%"},
+    ]
+
+    assert _nvtop_device_for_gpu(gpu, snapshot) == snapshot[0]
 
 
 def test_frame_uses_vendor_length_and_checksum() -> None:
@@ -192,6 +318,141 @@ def test_telemetry_renderer_uses_selected_temperature_unit(monkeypatch) -> None:
     assert "93°F" in command
 
 
+def test_telemetry_renderer_uses_openrgb_for_selected_text_widgets(
+    monkeypatch,
+) -> None:
+    command: list[str] = []
+
+    def run(arguments, **_kwargs):
+        command.extend(arguments)
+        return SimpleNamespace(stdout=b"PNG")
+
+    monkeypatch.setattr(media.subprocess, "run", run)
+    layout = Layout(
+        "OpenRGB",
+        [
+            Widget(
+                "custom-text",
+                color="#ffffff",
+                color_source="openrgb",
+                color_hue_shift=30,
+                color_brightness_percent=125,
+                text="RGB",
+            )
+        ],
+    )
+
+    assert render_telemetry_overlay(
+        {"cpu": {}, "gpu": {}, "network": {}},
+        layout,
+        openrgb_color="#ff3c00",
+    ) == b"PNG"
+    assert command[command.index("-fill") + 1] == adjust_mask_color(
+        "#ff3c00", 30, 125
+    )
+
+
+def test_telemetry_renderer_uses_each_widgets_gpu_and_temperature_unit(
+    monkeypatch,
+) -> None:
+    command: list[str] = []
+
+    def run(arguments, **_kwargs):
+        command.extend(arguments)
+        return SimpleNamespace(stdout=b"PNG")
+
+    monkeypatch.setattr(media.subprocess, "run", run)
+    monkeypatch.setattr(media, "image_magick_font", lambda font: font)
+    layout = Layout(
+        "GPUs",
+        [
+            Widget(
+                "gpu-temperature",
+                gpu_bdf="0000:04:00.0",
+                temperature_unit="C",
+            ),
+            Widget(
+                "gpu-temperature",
+                gpu_bdf="0000:85:00.0",
+                temperature_unit="F",
+            ),
+        ],
+    )
+
+    assert media.render_telemetry_overlay(
+        {
+            "cpu": {"temperature": 34, "load": 17},
+            "gpu": {"temperature": 0, "load": 0},
+            "gpus": {
+                "0000:04:00.0": {"temperature": 40, "load": 25},
+                "0000:85:00.0": {"temperature": 50, "load": 75},
+            },
+        },
+        layout,
+    ) == b"PNG"
+    assert "40°C" in command
+    assert "122°F" in command
+
+
+def test_state_collects_every_layout_gpu(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "darkflash_space_station.telemetry.cpu_temperature_c", lambda: 38
+    )
+    monkeypatch.setattr(
+        "darkflash_space_station.telemetry.gpu_temperature_c",
+        lambda bdf: {"0000:04:00.0": 45, "0000:85:00.0": 55}[bdf],
+    )
+    monkeypatch.setattr(
+        "darkflash_space_station.telemetry._nvtop_snapshot", lambda: [{}]
+    )
+    monkeypatch.setattr(
+        "darkflash_space_station.telemetry.gpu_utilization_percent",
+        lambda bdf, _snapshot: {"0000:04:00.0": 20, "0000:85:00.0": 70}[bdf],
+    )
+
+    payload = state(
+        SimpleNamespace(read=lambda: 10),
+        "0000:04:00.0",
+        include_gpu_load=True,
+        gpu_bdfs=["0000:85:00.0"],
+    )
+
+    assert payload["gpu"]["temperature"] == 45
+    assert payload["gpus"]["0000:04:00.0"]["load"] == 20
+    assert payload["gpus"]["0000:85:00.0"] == {
+        "load": 70,
+        "temperature": 55,
+        "fan": 0,
+        "speed": 0,
+        "power": 0,
+        "voltage": 0,
+        "memoryUsage": 0,
+        "dedicated": 0,
+        "dedicatedTotal": 0,
+    }
+
+
+def test_gpu_graph_history_uses_widget_gpu_and_temperature_unit() -> None:
+    history = TelemetryHistory()
+    history.add(
+        {
+            "gpu": {"temperature": 40, "load": 10},
+            "gpus": {
+                "0000:04:00.0": {"temperature": 45, "load": 20},
+                "0000:85:00.0": {"temperature": 50, "load": 70},
+            },
+        }
+    )
+    widget = Widget(
+        "gpu-temperature",
+        graph_style="line",
+        gpu_bdf="0000:85:00.0",
+        temperature_unit="F",
+    )
+
+    assert _graph_values(widget, {}, history) == [122]
+
+
 def test_telemetry_renderer_applies_the_panel_alignment_inset(monkeypatch) -> None:
     command: list[str] = []
 
@@ -277,12 +538,23 @@ def test_graph_widgets_persist_and_render_all_styles(tmp_path) -> None:
     widgets = [
         Widget("cpu-temperature", 10, 10, graph_style="bar", width=80, height=40, history_seconds=15),
         Widget("cpu-load", 100, 10, graph_style="line", width=80, height=40),
-        Widget("gpu-temperature", 10, 80, graph_style="circular-line", width=60, height=60),
+        Widget(
+            "gpu-temperature",
+            10,
+            80,
+            graph_style="circular-line",
+            width=60,
+            height=60,
+            gpu_bdf="0000:85:00.0",
+            temperature_unit="F",
+        ),
         Widget("network-download", 100, 80, graph_style="pie", width=60, height=60),
     ]
     store = LayoutStore(tmp_path / "layouts.json")
     store.save({"Graphs": Layout("Graphs", widgets)})
     layout = store.load()["Graphs"]
+    assert layout.widgets[2].gpu_bdf == "0000:85:00.0"
+    assert layout.widgets[2].temperature_unit == "F"
     history = TelemetryHistory(clock=lambda: 1)
     history.add(
         {
@@ -341,6 +613,113 @@ def test_old_graph_layout_defaults_history_seconds(tmp_path) -> None:
     )
 
     assert store.load()["Graphs"].widgets[0].history_seconds == 60
+    assert store.load()["Graphs"].media == LayoutMedia(kind="inherit")
+
+
+def test_layout_media_round_trips_with_gif_settings(tmp_path) -> None:
+    store = LayoutStore(tmp_path / "layouts.json")
+    selected = LayoutMedia(
+        kind="gif",
+        file="/media/layout.gif",
+        gif_mask_mode="openrgb",
+        gif_mask_color="#ff3c00",
+        gif_speed_source="max",
+        gif_speed_gpu_bdf="0000:04:00.0",
+        gif_hue_shift=25,
+        gif_brightness_percent=135,
+    )
+
+    store.save({"Gaming": Layout("Gaming", [Widget("gpu-load")], selected)})
+
+    assert store.load()["Gaming"].media == selected
+
+
+def test_text_widget_openrgb_color_source_round_trips(tmp_path) -> None:
+    store = LayoutStore(tmp_path / "layouts.json")
+    store.save(
+        {
+            "RGB": Layout(
+                "RGB",
+                [
+                    Widget(
+                        "time",
+                        color="#ffffff",
+                        color_source="openrgb",
+                        color_hue_shift=-15,
+                        color_brightness_percent=150,
+                    )
+                ],
+            )
+        }
+    )
+
+    widget = store.load()["RGB"].widgets[0]
+    assert widget.color_source == "openrgb"
+    assert widget.color_hue_shift == -15
+    assert widget.color_brightness_percent == 150
+
+
+def test_render_background_image_encodes_a_static_h264_video(
+    monkeypatch, tmp_path
+) -> None:
+    source = tmp_path / "background.png"
+    source.write_bytes(b"png")
+    command = []
+
+    def run(arguments, **_kwargs):
+        command.extend(arguments)
+        Path(arguments[-1]).write_bytes(b"mp4")
+
+    monkeypatch.setattr(media.subprocess, "run", run)
+
+    assert render_background_image(source) == b"mp4"
+    assert command[:5] == ["ffmpeg", "-v", "error", "-y", "-loop"]
+    assert str(source) in command
+    assert "scale=320:320:force_original_aspect_ratio=increase,crop=320:320" in command
+    assert ["-c:v", "libx264"] == command[
+        command.index("-c:v") : command.index("-c:v") + 2
+    ]
+
+
+def test_render_blank_background_uses_a_black_ffmpeg_source(monkeypatch) -> None:
+    command = []
+
+    def run(arguments, **_kwargs):
+        command.extend(arguments)
+        Path(arguments[-1]).write_bytes(b"mp4")
+
+    monkeypatch.setattr(media.subprocess, "run", run)
+
+    assert render_blank_background() == b"mp4"
+    assert ["-f", "lavfi", "-i", "color=c=black:s=320x320:r=20"] == command[
+        command.index("-f") : command.index("-f") + 4
+    ]
+
+
+def test_masked_gif_preview_is_tinted_and_cached(monkeypatch, tmp_path) -> None:
+    source = tmp_path / "source.gif"
+    source.write_bytes(b"gif")
+    commands = []
+
+    def run(arguments, **_kwargs):
+        commands.append(arguments)
+        Path(arguments[-1]).write_bytes(b"masked")
+
+    monkeypatch.setattr(media.subprocess, "run", run)
+    directory = tmp_path / "previews"
+    directory.mkdir()
+    for index in range(35):
+        (directory / f"old-{index}.gif").write_bytes(b"old")
+
+    first = render_masked_gif_preview(source, "#ff3c00", directory)
+    second = render_masked_gif_preview(source, "#ff3c00", directory)
+
+    assert first == second
+    assert first.read_bytes() == b"masked"
+    assert len(commands) == 1
+    assert "+level-colors" in commands[0]
+    assert "#000000,#ff3c00" in commands[0]
+    assert len(list(directory.glob("*.gif"))) == media.GIF_PREVIEW_CACHE_LIMIT
 
 
 def test_resize_values_bounds_text_font_size_and_graph_dimensions() -> None:
@@ -446,6 +825,110 @@ def test_gui_settings_fall_back_for_missing_or_malformed_json(tmp_path) -> None:
     assert store.load() == AppSettings()
     store.path.write_text("{not valid JSON")
     assert store.load() == AppSettings()
+
+
+def test_settings_store_retains_the_last_selected_gif(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    first = tmp_path / "first.gif"
+    second = tmp_path / "second.gif"
+    first.write_bytes(b"first")
+    second.write_bytes(b"second")
+
+    assert store.save_gif(first) == tmp_path / "media/background.gif"
+    assert store.saved_gif().read_bytes() == b"first"
+
+    store.save_gif(second)
+
+    assert store.saved_gif().read_bytes() == b"second"
+
+
+def test_legacy_layout_media_resolves_to_retained_global_gif(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    source = tmp_path / "selected.gif"
+    source.write_bytes(b"gif")
+    retained = store.save_gif(source)
+    settings = AppSettings(
+        gif_mask_mode="openrgb",
+        gif_mask_color="#ff3c00",
+        gif_speed_source="gpu",
+        gif_hue_shift=12,
+        gif_brightness_percent=125,
+    )
+
+    selected, reload_settings = resolved_layout_media(
+        Layout("Legacy"), store, settings
+    )
+
+    assert reload_settings
+    assert selected == LayoutMedia(
+        kind="gif",
+        file=str(retained),
+        gif_mask_mode="openrgb",
+        gif_mask_color="#ff3c00",
+        gif_speed_source="gpu",
+        gif_speed_gpu_bdf=settings.gpu_bdf,
+        gif_hue_shift=12,
+        gif_brightness_percent=125,
+    )
+
+
+def test_layout_media_overrides_global_media_settings(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    selected = LayoutMedia(
+        kind="image",
+        file="/media/layout.png",
+        gif_mask_mode="manual",
+        gif_mask_color="#123456",
+    )
+
+    resolved, reload_settings = resolved_layout_media(
+        Layout("Photo", media=selected), store, AppSettings()
+    )
+
+    assert resolved is selected
+    assert not reload_settings
+
+
+def test_gui_restores_saved_gif_and_cached_openrgb_color(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    source = tmp_path / "selected.gif"
+    source.write_bytes(b"gif")
+    saved = store.save_gif(source)
+    cache = AnimationCache(store)
+    cache.directory.mkdir(parents=True)
+    cache.manifest_path.write_text(
+        f'{{"version": {CACHE_VERSION}, "mask_color": "#ff3c00"}}\n'
+    )
+
+    assert restored_gif_sync_state(
+        store, AppSettings(gif_mask_mode="openrgb")
+    ) == (saved, "#ff3c00")
+
+
+def test_restore_saved_animation_applies_the_saved_mask(monkeypatch, tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    source = tmp_path / "selected.gif"
+    source.write_bytes(b"gif")
+    saved = store.save_gif(source)
+    calls = []
+    controller = SimpleNamespace(
+        show_animation=lambda selected, color: calls.append((selected, color))
+    )
+    settings = AppSettings(gif_mask_mode="openrgb")
+    monkeypatch.setattr(
+        "darkflash_space_station.cli.gif_mask_color",
+        lambda selected_settings: "#ff3c00",
+    )
+
+    assert restore_saved_animation(controller, store, settings)
+    assert calls == [(saved, "#ff3c00")]
+
+
+def test_restore_saved_animation_skips_when_no_gif_is_saved(tmp_path) -> None:
+    store = SettingsStore(tmp_path / "settings.json")
+    controller = SimpleNamespace(show_animation=lambda *_args: None)
+
+    assert not restore_saved_animation(controller, store, AppSettings())
 
 
 def test_layout_selection_can_avoid_marking_layout_edits_dirty(tmp_path) -> None:

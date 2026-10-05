@@ -7,7 +7,7 @@ import re
 import subprocess
 import time
 from collections import deque
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -46,6 +46,20 @@ class TelemetryHistory:
             value = payload.get(section)
             if isinstance(value, Mapping) and isinstance(value.get(field), (int, float)):
                 self._samples[metric].append((now, float(value[field])))
+        gpus = payload.get("gpus")
+        if isinstance(gpus, Mapping):
+            for bdf, gpu in gpus.items():
+                if not isinstance(bdf, str) or not isinstance(gpu, Mapping):
+                    continue
+                for metric, field in (
+                    ("gpu-temperature", "temperature"),
+                    ("gpu-load", "load"),
+                ):
+                    value = gpu.get(field)
+                    if isinstance(value, (int, float)):
+                        self._samples.setdefault(f"{metric}@{bdf}", deque()).append(
+                            (now, float(value))
+                        )
         self._prune(now)
 
     def values(self, metric: str, seconds: float | None = None) -> list[float]:
@@ -119,7 +133,13 @@ def _pci_name(vendor_id: str, device_id: str, pci_ids: Path) -> str | None:
                 if candidate.startswith(f"\t{device_id} "):
                     device_name = candidate.split(maxsplit=1)[1]
                     match = re.search(r"\[([^\]]+)\]", device_name)
-                    device_name = match.group(1) if match else device_name
+                    if match and match.group(1).casefold() not in {
+                        "intel graphics",
+                        "vga compatible controller",
+                    }:
+                        device_name = match.group(1)
+                    elif match:
+                        device_name = device_name[: match.start()].strip()
                     vendor_name = re.sub(
                         r"\s+(?:Corporation|Inc\.?|Ltd\.?)$", "", vendor_name
                     )
@@ -224,6 +244,69 @@ def gpu_temperature_c(
     return None
 
 
+def _nvtop_snapshot() -> list[dict]:
+    try:
+        snapshot = json.loads(
+            subprocess.run(
+                ["nvtop", "--snapshot", "--no-color", "--no-plot", "--no-processes"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as exc:
+        raise TelemetryError(f"unable to read nvtop GPU utilization: {exc}") from exc
+    if not isinstance(snapshot, list):
+        raise TelemetryError("nvtop did not return a device list")
+    return [device for device in snapshot if isinstance(device, dict)]
+
+
+def _nvtop_device_for_gpu(gpu: DetectedGpu, snapshot: list[dict]) -> dict | None:
+    target_words = set(re.findall(r"[a-z0-9]+", gpu.name.lower())) - {
+        "corporation",
+        "controller",
+        "graphics",
+        "intel",
+        "nvidia",
+        "radeon",
+    }
+    if not target_words:
+        return None
+    scored_matches = [
+        (
+            len(
+                target_words
+                & set(
+                    re.findall(
+                        r"[a-z0-9]+", str(device.get("device_name")).lower()
+                    )
+                )
+            ),
+            device,
+        )
+        for device in snapshot
+    ]
+    best_score = max((score for score, _device in scored_matches), default=0)
+    matches = [device for score, device in scored_matches if score == best_score]
+    return matches[0] if best_score >= 2 and len(matches) == 1 else None
+
+
+def gpu_utilization_percent(
+    gpu_bdf: str, snapshot: list[dict] | None = None
+) -> float:
+    """Read selected-GPU utilization using the same nvtop source as PC Monitor."""
+    gpu = next((device for device in detected_gpus() if device.bdf == gpu_bdf), None)
+    if gpu is None:
+        raise TelemetryError(f"GPU {gpu_bdf!r} was not found")
+    device = _nvtop_device_for_gpu(gpu, snapshot or _nvtop_snapshot())
+    if device is None:
+        raise TelemetryError(f"nvtop did not identify GPU {gpu.name!r}")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)%", str(device.get("gpu_util")))
+    if match is None:
+        raise TelemetryError(f"nvtop did not report utilization for {gpu.name!r}")
+    return max(0, min(100, float(match.group(1))))
+
+
 def _cpu_ticks(path: Path = Path("/proc/stat")) -> tuple[int, int]:
     try:
         fields = path.read_text().splitlines()[0].split()
@@ -280,6 +363,9 @@ def state(
     gpu_bdf: str,
     network: NetworkThroughput | None = None,
     temperature_average: TemperatureAverage | None = None,
+    *,
+    include_gpu_load: bool = False,
+    gpu_bdfs: Iterable[str] | None = None,
 ) -> dict[str, object]:
     """Return the stock theme's complete CPU/GPU status payload."""
     usage = round(cpu_usage.read())
@@ -287,7 +373,33 @@ def state(
     cpu_temperature = cpu_temperature_c()
     if temperature_average is not None:
         cpu_temperature = temperature_average.add(cpu_temperature)
-    gpu_temperature = gpu_temperature_c(gpu_bdf)
+    requested_gpus = list(dict.fromkeys([gpu_bdf, *(gpu_bdfs or ())]))
+    utilization_snapshot = _nvtop_snapshot() if include_gpu_load else None
+    gpus = {}
+    for requested_bdf in requested_gpus:
+        gpu_temperature = gpu_temperature_c(requested_bdf)
+        gpus[requested_bdf] = {
+            "load": (
+                round(
+                    gpu_utilization_percent(
+                        requested_bdf, utilization_snapshot
+                    )
+                )
+                if include_gpu_load
+                else 0
+            ),
+            "temperature": (
+                round(gpu_temperature) if gpu_temperature is not None else 0
+            ),
+            "fan": 0,
+            "speed": 0,
+            "power": 0,
+            "voltage": 0,
+            "memoryUsage": 0,
+            "dedicated": 0,
+            "dedicatedTotal": 0,
+        }
+    primary_gpu = gpus[gpu_bdf]
     return {
         "network": {"upload": round(upload, 1), "download": round(download, 1)},
         "memory": {"total": 0, "used": 0, "load": 0, "temperature": 0, "speed": 0},
@@ -299,17 +411,8 @@ def state(
             "voltage": 0,
             "usage": usage,
         },
-        "gpu": {
-            "load": 0,
-            "temperature": round(gpu_temperature) if gpu_temperature is not None else 0,
-            "fan": 0,
-            "speed": 0,
-            "power": 0,
-            "voltage": 0,
-            "memoryUsage": 0,
-            "dedicated": 0,
-            "dedicatedTotal": 0,
-        },
+        "gpu": primary_gpu,
+        "gpus": gpus,
         "disk": {
             "total": 0,
             "used": 0,

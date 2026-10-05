@@ -36,9 +36,11 @@ project does not guess at HID operations.
 ## Requirements
 
 - Python 3.11+
-- ImageMagick (`convert`) and Fontconfig (`fc-list`) for media and overlays
+- ImageMagick (`magick`/`convert`) and Fontconfig (`fc-list`) for media, masked
+  previews, and overlays
 - FFmpeg with `libx264` for GIF conversion
 - `lm_sensors` (`sensors -j`) for CPU temperatures
+- `nvtop` for GPU utilization and GPU-driven adaptive GIF speed
 - GTK 4, Libadwaita, and PyGObject for the optional GUI
 - A udev rule granting the desktop user read/write access to the cooler's
   `hidraw` device
@@ -47,7 +49,7 @@ Package names vary by distribution. On Arch Linux, the runtime dependencies
 are available as:
 
 ```bash
-sudo pacman -S python imagemagick ffmpeg lm_sensors gtk4 libadwaita python-gobject
+sudo pacman -S python imagemagick ffmpeg lm_sensors nvtop gtk4 libadwaita python-gobject
 ```
 
 OpenRGB is optional and is needed only for LED-derived GIF masking.
@@ -124,10 +126,9 @@ darkflash-space-station telemetry --gpu-bdf 0000:04:00.0 --interval 1
 ```
 
 Run `darkflash-space-station --help` or append `--help` to any subcommand for
-the complete argument reference. The CLI defaults to GPU PCI address
-`0000:04:00.0`; pass `--gpu-bdf` when the intended GPU uses another address.
-When that address is absent, GPU telemetry is reported as unavailable rather
-than silently selecting another card.
+the complete argument reference. Saved layouts select a GPU and temperature
+unit per widget. `--gpu-bdf` and `--temperature-unit` remain fallback values
+for legacy layouts without those widget fields.
 
 ## GTK desktop app
 
@@ -151,27 +152,60 @@ install -m644 darkflash-space-station.desktop \
 
 The app provides:
 
+- A sectioned Device, Telemetry, and Layout interface; the Layout section uses
+  a layout thumbnail gallery, the selected layout's widgets with an Add button,
+  a dominant live preview with bottom-right Save/Cancel actions, and a
+  contextual control pane on the far right. The **Widgets** button beside
+  **Media** restores or collapses the layout-widget list column, which starts
+  hidden.
 - **Device:** status refresh and wake.
-- **Media:** still-image selection, GIF/video upload, and overlay clearing.
-  GIF uploads can leave source colors unchanged, apply a manual luminance mask,
-  or use the current first LED color from OpenRGB's `ARGB_V2_3` zone. OpenRGB
-  masking requires its local SDK server (`openrgb --server`) to be running.
-  **Sync GIF with OpenRGB** polls that LED every three seconds and re-uploads
-  the most recently uploaded OpenRGB-masked GIF after the new color is stable
-  for one additional poll. Stop the telemetry background service first because
-  the cooler allows only one active HID writer.
+- **Layout media:** the **Media** button beside the layout preview opens image
+  and GIF controls in the same far-right pane used by widget controls. Each
+  layout saves its own media file, GIF mask, hue, brightness, and adaptive-speed
+  source. The selected image or animated GIF appears beneath the widgets in the
+  live preview, and animated GIFs also play in each layout-selection thumbnail.
+  Both previews use the layout's effective manual/OpenRGB mask, hue shift, and
+  brightness so their colors match the rendered display background.
+  Choosing media alone does not write to the device; **Apply** saves the active
+  layout and restarts the Display service.
+  Still images are encoded as looping H.264 backgrounds so telemetry remains on
+  the separate foreground OSD layer. GIF masks can leave source colors
+  unchanged, apply a manual luminance mask, or use the current first LED color
+  from OpenRGB's `ARGB_V2_3` zone. OpenRGB masking requires its local SDK server
+  (`openrgb --server`) to be running.
+  Adaptive playback can pre-render ten cached variants: 0–10% load uses 1×,
+  each additional 10% selects the next linear step, and 91–100% uses 3×.
+  Speed can follow CPU load, a per-layout selected GPU's load, or the highest
+  current load across the CPU and every detected GPU; a new range must remain
+  active for five seconds before its cached MP4 is uploaded. OpenRGB
+  color changes rebuild all ten variants before the updated background is sent.
+  Hue rotation and brightness calibration can be applied to manual or OpenRGB
+  mask colors; the running service detects tuning changes and rebuilds its
+  cached variants automatically.
+  **OpenRGB color sync** is automatic through the Display service whenever the
+  OpenRGB mask is selected. It polls that LED every three seconds and rebuilds
+  the cached variants when the adjusted color changes.
 - **Display:** sleep timeout configuration.
-- **Native telemetry:** friendly detected-GPU dropdown (for example, Intel Arc
-  Pro B50), persisted Celsius/Fahrenheit selector, transparent CPU/GPU overlay,
-  one-shot update, and start/stop stream. Temperatures use a degree symbol
-  (for example, `34°C` or `93°F`).
+- **Display runtime:** an always-on display service that prevents sleep,
+  restores GIF media, manages adaptive playback, and renders the saved layout.
+  A separate temporary preview can show the current unsaved layout.
+  Each GPU widget has its own detected-GPU selector (for example, Intel Arc Pro
+  B50), and each CPU/GPU temperature widget has its own Celsius/Fahrenheit
+  selector. Telemetry also includes transparent overlays, one-shot update, and
+  start/stop preview. Temperatures use a degree symbol (for example, `34°C` or
+  `93°F`).
 - **Telemetry layout:** named 320×320 layouts with an explicit **Save layout**
   button and a **Reset layout** option. Edits remain in memory until saved;
   Reset discards all pending layout edits and restores the selected saved
-  layout. Switching layouts keeps pending edits available and the active layout
-  is updated on save. Layouts support
+  layout. Selecting a saved layout immediately makes it active and restarts the
+  Display service, while pending widget/media edits still require **Save** or
+  **Apply** before the service uses them. Layouts support
   draggable CPU/GPU temperature and load, network upload/download, time, date,
   and custom-text widgets, plus per-widget font, size, and color controls.
+  Text widgets can use either their saved manual color or follow OpenRGB's
+  `ARGB_V2_3` color; the preview and Display service refresh that color every
+  three seconds. OpenRGB text can apply its own −180° to +180° hue shift and
+  25% to 200% brightness adjustment per widget.
   Selecting a widget reveals a lower-right resize handle: drag it to resize a
   text widget's font or a graph's width and height. Moving or resizing shows a
   translucent outline of the final position or size before the edit is applied.
@@ -192,8 +226,8 @@ The app provides:
   in the layout JSON.
 
 Errors appear as in-app notifications. The app serializes every HID write. Stop
-the telemetry stream before switching media so a foreground action is not
-waiting for the stream to release the device.
+the display service or temporary telemetry preview before a foreground media
+operation so it is not waiting for the active writer to release the device.
 
 Saved layouts are stored in
 `~/.config/darkflash-space-station/layouts.json`. The selected GUI layout is
@@ -206,9 +240,12 @@ Graph entries use the same metric names as text widgets and add
 `graph_style`, `width`, `height`, and `history_seconds` fields. Missing
 `history_seconds` values default to 60 seconds, so existing layout files remain
 compatible and can be edited or backed up as JSON.
+Each layout object also contains a `media` object. Legacy layout files that
+store only a widget list continue to inherit the previously retained global GIF
+until their media is explicitly changed.
 
-The GUI also saves its selected GPU, telemetry refresh interval, display sleep
-timeout, temperature unit, and currently selected layout in
+The GUI also saves its telemetry refresh interval, display sleep timeout, and
+currently selected layout in
 `~/.config/darkflash-space-station/settings.json`. These preferences are saved
 when changed and are separate from editable layout data: widget/layout edits
 still require **Save layout**.
@@ -244,11 +281,12 @@ The display's accepted GIF path is not a host-streamed sequence of PNGs:
 The current encoder targets 675 kbps; source GIF complexity and duration still
 determine whether the converted media fits the device.
 
-## Background telemetry-overlay service
+## Always-on display service
 
-The user service continuously renders the active saved telemetry layout as the
-foreground overlay, disables display sleep, and restarts after a failure. It
-does not require root:
+The user service prevents display sleep, restores and manages GIF media,
+continuously renders the active saved telemetry layout as the foreground
+overlay, and restarts after a failure. Keep it running even when the saved
+layout has no telemetry widgets. It does not require root:
 
 ```bash
 darkflash-space-station service install
@@ -260,7 +298,7 @@ darkflash-space-station service stop
 `service install` safely writes the managed unit to
 `~/.config/systemd/user/` and runs `systemctl --user daemon-reload`; `start`
 also enables the service for future logins. The GTK app exposes the same
-running/stopped status and Start/Stop control under **Native telemetry**.
+running/stopped status and Start/Stop control under **Display runtime**.
 
 Stop the service before using foreground CLI or GUI media controls. It is one
 of the possible HID writers described above.

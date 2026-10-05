@@ -1,4 +1,4 @@
-"""Management helpers for the background telemetry-overlay user service."""
+"""Management helpers for the always-on display user service."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ def unit_text(python: Path | None = None) -> str:
     # environment's site-packages and its editable project installation.
     executable = python or Path(sys.executable)
     return f"""[Unit]
-Description=darkFlash Space Station telemetry overlay
+Description=darkFlash Space Station display service
 After=graphical-session.target
 PartOf=graphical-session.target
 

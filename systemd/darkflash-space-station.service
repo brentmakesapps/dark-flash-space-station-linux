@@ -1,5 +1,5 @@
 [Unit]
-Description=darkFlash Space Station telemetry overlay
+Description=darkFlash Space Station display service
 After=graphical-session.target
 PartOf=graphical-session.target
 

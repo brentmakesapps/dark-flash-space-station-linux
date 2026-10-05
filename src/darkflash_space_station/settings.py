@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -22,6 +23,9 @@ class AppSettings:
     gif_mask_mode: str = "none"
     gif_mask_color: str = "#ffffff"
     snap_to_grid: bool = False
+    gif_speed_source: str = "none"
+    gif_hue_shift: float = 0
+    gif_brightness_percent: float = 100
 
 
 class SettingsStore:
@@ -47,6 +51,11 @@ class SettingsStore:
         gif_mask_mode = data.get("gif_mask_mode", defaults.gif_mask_mode)
         gif_mask_color = data.get("gif_mask_color", defaults.gif_mask_color)
         snap_to_grid = data.get("snap_to_grid", defaults.snap_to_grid)
+        gif_speed_source = data.get("gif_speed_source", defaults.gif_speed_source)
+        gif_hue_shift = data.get("gif_hue_shift", defaults.gif_hue_shift)
+        gif_brightness_percent = data.get(
+            "gif_brightness_percent", defaults.gif_brightness_percent
+        )
         try:
             valid_interval = (
                 isinstance(interval, (int, float))
@@ -91,8 +100,53 @@ class SettingsStore:
                 else defaults.gif_mask_color
             ),
             snap_to_grid=snap_to_grid if isinstance(snap_to_grid, bool) else defaults.snap_to_grid,
+            gif_speed_source=(
+                gif_speed_source
+                if isinstance(gif_speed_source, str)
+                and gif_speed_source in {"none", "cpu", "gpu", "max"}
+                else defaults.gif_speed_source
+            ),
+            gif_hue_shift=(
+                float(gif_hue_shift)
+                if isinstance(gif_hue_shift, (int, float))
+                and not isinstance(gif_hue_shift, bool)
+                and math.isfinite(float(gif_hue_shift))
+                and -180 <= float(gif_hue_shift) <= 180
+                else defaults.gif_hue_shift
+            ),
+            gif_brightness_percent=(
+                float(gif_brightness_percent)
+                if isinstance(gif_brightness_percent, (int, float))
+                and not isinstance(gif_brightness_percent, bool)
+                and math.isfinite(float(gif_brightness_percent))
+                and 25 <= float(gif_brightness_percent) <= 200
+                else defaults.gif_brightness_percent
+            ),
         )
 
     def save(self, settings: AppSettings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(json.dumps(asdict(settings), indent=2) + "\n")
+
+    @property
+    def saved_gif_path(self) -> Path:
+        return self.path.parent / "media" / "background.gif"
+
+    def save_gif(self, source: Path) -> Path:
+        """Retain an atomic private copy of the last successfully uploaded GIF."""
+        target = self.saved_gif_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if source.resolve() == target.resolve():
+            return target
+        temporary = target.with_suffix(".gif.tmp")
+        try:
+            shutil.copyfile(source, temporary)
+            temporary.replace(target)
+            (target.parent / "speeds" / "manifest.json").unlink(missing_ok=True)
+        except OSError:
+            temporary.unlink(missing_ok=True)
+            raise
+        return target
+
+    def saved_gif(self) -> Path | None:
+        return self.saved_gif_path if self.saved_gif_path.is_file() else None

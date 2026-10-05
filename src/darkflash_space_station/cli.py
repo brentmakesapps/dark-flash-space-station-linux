@@ -7,10 +7,13 @@ import json
 import subprocess
 from pathlib import Path
 
+from .animation import AdaptiveAnimation, AnimationCache
 from .controller import SpaceStation
 from .hid import HidError
-from .layout import LayoutStore
-from .settings import SettingsStore
+from .layout import Layout, LayoutMedia, LayoutStore
+from .media import render_background_image, render_blank_background
+from .openrgb import gif_mask_color
+from .settings import AppSettings, SettingsStore
 from .service import (
     install_service,
     service_status,
@@ -18,7 +21,37 @@ from .service import (
     stop_service,
 )
 
-DEFAULT_GPU_BDF = "0000:04:00.0"
+def restore_saved_animation(
+    controller: SpaceStation, store: SettingsStore, settings: AppSettings
+) -> bool:
+    """Reapply the retained GIF and its saved mask, if one exists."""
+    source = store.saved_gif()
+    if source is None:
+        return False
+    controller.show_animation(source, gif_mask_color(settings))
+    return True
+
+
+def resolved_layout_media(
+    layout: Layout, store: SettingsStore, settings: AppSettings
+) -> tuple[LayoutMedia, bool]:
+    """Resolve legacy inherited media into the active layout's runtime settings."""
+    if layout.media.kind != "inherit":
+        return layout.media, False
+    source = store.saved_gif()
+    return (
+        LayoutMedia(
+            kind="gif" if source else "none",
+            file=str(source) if source else "",
+            gif_mask_mode=settings.gif_mask_mode,
+            gif_mask_color=settings.gif_mask_color,
+            gif_speed_source=settings.gif_speed_source,
+            gif_speed_gpu_bdf=settings.gpu_bdf,
+            gif_hue_shift=settings.gif_hue_shift,
+            gif_brightness_percent=settings.gif_brightness_percent,
+        ),
+        True,
+    )
 
 
 def _path(value: str) -> Path:
@@ -52,7 +85,11 @@ def _parser() -> argparse.ArgumentParser:
     media_commands.add_parser("clear-overlay", help="clear foreground OSD content")
 
     telemetry = commands.add_parser("telemetry", help="send native stock-theme telemetry")
-    telemetry.add_argument("--gpu-bdf", default=DEFAULT_GPU_BDF)
+    telemetry.add_argument(
+        "--gpu-bdf",
+        default=SettingsStore().load().gpu_bdf,
+        help="fallback GPU for legacy layouts without per-widget selection",
+    )
     telemetry.add_argument("--interval", type=float, default=1.0)
     telemetry.add_argument(
         "--temperature-unit",
@@ -77,7 +114,7 @@ def _parser() -> argparse.ArgumentParser:
     )
 
     service = commands.add_parser(
-        "service", help="manage the background telemetry-overlay user service"
+        "service", help="manage the always-on display user service"
     )
     service_commands = service.add_subparsers(dest="service_command", required=True)
     service_commands.add_parser(
@@ -97,6 +134,8 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _parser().parse_args()
     controller = SpaceStation()
+    settings_store = SettingsStore()
+    settings = settings_store.load()
     try:
         if args.command == "status":
             print(json.dumps(controller.status(), indent=2, sort_keys=True))
@@ -113,14 +152,56 @@ def main() -> None:
                 controller.clear_overlay()
         elif args.command == "telemetry":
             layout = LayoutStore().active_layout(args.layout) if args.overlay else None
+            adaptive_animation = None
+            animation_load_source = settings.gif_speed_source
+            if args.overlay:
+                media, reload_media_settings = resolved_layout_media(
+                    layout, settings_store, settings
+                )
+                animation_gpu_bdf = media.gif_speed_gpu_bdf or args.gpu_bdf
+                media_settings = settings if reload_media_settings else media
+                animation_load_source = media.gif_speed_source
+                if media.kind == "gif":
+                    saved_gif = Path(media.file) if media.file else None
+                    if saved_gif is None or not saved_gif.is_file():
+                        raise ValueError(
+                            f"layout media does not exist: {media.file or '(missing path)'}"
+                        )
+                    adaptive_animation = AdaptiveAnimation(
+                        saved_gif,
+                        media_settings,
+                        AnimationCache(
+                            settings_store,
+                            (
+                                saved_gif.parent
+                                / f"{saved_gif.stem}-speeds"
+                                if not reload_media_settings
+                                else None
+                            ),
+                        ),
+                        reload_settings=reload_media_settings,
+                    )
+                elif media.kind == "image" and media.file:
+                    image = Path(media.file)
+                    if not image.is_file():
+                        raise ValueError(f"layout media does not exist: {image}")
+                    controller.show_rendered_animation(
+                        render_background_image(image), image.stem
+                    )
+                elif media.kind == "none" and not reload_media_settings:
+                    controller.show_rendered_animation(
+                        render_blank_background(), "blank"
+                    )
             updates = controller.telemetry_updates(
-                args.gpu_bdf,
+                animation_gpu_bdf if args.overlay else args.gpu_bdf,
                 args.interval,
                 lambda: False,
                 overlay=args.overlay,
                 layout=layout,
                 keep_awake=args.keep_awake,
                 temperature_unit=args.temperature_unit,
+                adaptive_animation=adaptive_animation,
+                animation_load_source=animation_load_source,
             )
             for payload in updates:
                 print(json.dumps(payload, sort_keys=True))

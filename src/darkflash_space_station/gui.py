@@ -3,18 +3,27 @@
 from __future__ import annotations
 
 import subprocess
+import shutil
 import threading
 from pathlib import Path
+from uuid import uuid4
 
+from .animation import AnimationCache
 from .controller import SpaceStation
-from .media import format_temperature
-from .openrgb import argb_v2_3_color
+from .hid import HidError
+from .media import (
+    format_temperature,
+    render_masked_gif_preview,
+    render_telemetry_overlay,
+)
+from .openrgb import OpenRgbError, adjust_mask_color, argb_v2_3_color
 from .layout import (
     DISPLAY_SIZE,
     GRAPH_METRICS,
     GRAPH_STYLES,
     Layout,
     LayoutDraft,
+    LayoutMedia,
     LayoutStore,
     WIDGETS,
     resize_values,
@@ -23,6 +32,17 @@ from .layout import (
 )
 from .service import service_active, start_service, stop_service
 from .settings import AppSettings, SettingsStore
+from .telemetry import TelemetryHistory
+
+
+def restored_gif_sync_state(
+    store: SettingsStore, settings: AppSettings
+) -> tuple[Path | None, str | None]:
+    """Restore the retained GIF and its last rendered OpenRGB mask color."""
+    source = store.saved_gif()
+    if source is None or settings.gif_mask_mode != "openrgb":
+        return source, None
+    return source, AnimationCache(store).mask_color()
 from .telemetry import detected_gpus
 
 PREVIEW_GRID_SPACING = 40
@@ -54,12 +74,57 @@ def main() -> None:
         import gi
 
         gi.require_version("Adw", "1")
+        gi.require_version("GdkPixbuf", "2.0")
         gi.require_version("Gtk", "4.0")
-        from gi.repository import Adw, Gdk, Gio, GLib, Gtk
+        from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk
     except (ImportError, ValueError) as exc:
         raise SystemExit(
             "GTK 4 and Libadwaita bindings are required; install python-gobject and libadwaita"
         ) from exc
+
+    class AnimatedGif(Gtk.DrawingArea):
+        def __init__(self, source: Path, size: int) -> None:
+            super().__init__()
+            self.set_content_width(size)
+            self.set_content_height(size)
+            self.set_can_target(False)
+            self.animation = GdkPixbuf.PixbufAnimation.new_from_file(str(source))
+            self.iterator = self.animation.get_iter(None)
+            self.was_rooted = False
+            self.set_draw_func(self._draw_frame)
+            self._schedule_next_frame()
+
+        def _schedule_next_frame(self) -> None:
+            delay = max(20, self.iterator.get_delay_time())
+            GLib.timeout_add(delay, self._advance_frame)
+
+        def _advance_frame(self) -> bool:
+            if self.get_root() is not None:
+                self.was_rooted = True
+            elif self.was_rooted:
+                return GLib.SOURCE_REMOVE
+            self.iterator.advance(None)
+            self.queue_draw()
+            self._schedule_next_frame()
+            return GLib.SOURCE_REMOVE
+
+        def _draw_frame(
+            self, _area: Gtk.DrawingArea, context: object, width: int, height: int
+        ) -> None:
+            frame = self.iterator.get_pixbuf()
+            scale = max(width / frame.get_width(), height / frame.get_height())
+            scaled_width = max(1, round(frame.get_width() * scale))
+            scaled_height = max(1, round(frame.get_height() * scale))
+            scaled = frame.scale_simple(
+                scaled_width, scaled_height, GdkPixbuf.InterpType.BILINEAR
+            )
+            Gdk.cairo_set_source_pixbuf(
+                context,
+                scaled,
+                (width - scaled_width) / 2,
+                (height - scaled_height) / 2,
+            )
+            context.paint()
 
     class SpaceStationApplication(Adw.Application):
         def __init__(self) -> None:
@@ -81,11 +146,16 @@ def main() -> None:
             self.selected_widget = 0
             self.preview_font: str | None = None
             self.updating_layout_controls = False
+            self.updating_media_controls = False
             self.resetting_layout = False
             self.telemetry_stop = threading.Event()
-            self.gif_sync_stop = threading.Event()
-            self.gif_sync_source: Path | None = None
-            self.gif_sync_color: str | None = None
+            self.layout_apply_lock = threading.Lock()
+            self.layout_apply_generation = 0
+            self.gif_sync_source, self.gif_sync_color = restored_gif_sync_state(
+                self.settings_store, self.settings
+            )
+            self.openrgb_text_color: str | None = self.gif_sync_color
+            self.openrgb_text_error: str | None = None
             self.window: Adw.ApplicationWindow | None = None
             self.toast_overlay: Adw.ToastOverlay | None = None
             self.status_label: Gtk.Label | None = None
@@ -115,8 +185,22 @@ def main() -> None:
             self.interval.set_value(self.settings.refresh_interval)
             self.timeout = Gtk.SpinButton.new_with_range(0, 3600, 1)
             self.timeout.set_value(self.settings.sleep_timeout)
-            self.layout_selector = Gtk.DropDown.new_from_strings(list(self.layouts))
-            self.layout_selector.set_selected(list(self.layouts).index(self.layout.name))
+            self.layout_list = Gtk.ListBox(
+                selection_mode=Gtk.SelectionMode.SINGLE,
+                activate_on_single_click=True,
+            )
+            self.layout_list.add_css_class("boxed-list")
+            self.layout_list_names: list[str] = []
+            self._rebuild_layout_list(self.layout.name)
+            self.layout_widget_list = Gtk.ListBox(
+                selection_mode=Gtk.SelectionMode.SINGLE,
+                activate_on_single_click=True,
+            )
+            self.layout_widget_list.add_css_class("boxed-list")
+            self.layout_widget_list.add_css_class("layout-widget-list")
+            self.layout_widget_list.connect(
+                "row-selected", self._select_layout_widget
+            )
             self.widget_selector = Gtk.DropDown.new_from_strings([])
             self.fonts = installed_font_families()
             self.font_selector = Gtk.DropDown.new_from_strings(self.fonts)
@@ -131,6 +215,11 @@ def main() -> None:
             color_dialog = Gtk.ColorDialog.new()
             color_dialog.set_title("Widget color")
             self.color = Gtk.ColorDialogButton.new(color_dialog)
+            self.color_source = Gtk.DropDown.new_from_strings(
+                ["Manual color", "OpenRGB ARGB_V2_3"]
+            )
+            self.text_hue_shift = Gtk.SpinButton.new_with_range(-180, 180, 1)
+            self.text_brightness = Gtk.SpinButton.new_with_range(25, 200, 1)
             self.custom_text = Gtk.Entry(placeholder_text="Custom text")
             self.gif_mask_mode = Gtk.DropDown.new_from_strings(
                 ["No mask", "Manual color", "OpenRGB ARGB_V2_3"]
@@ -144,7 +233,20 @@ def main() -> None:
             mask_rgba = Gdk.RGBA()
             mask_rgba.parse(self.settings.gif_mask_color)
             self.gif_mask_color.set_rgba(mask_rgba)
-            self.gif_sync = Gtk.Switch(valign=Gtk.Align.CENTER)
+            self.gif_hue_shift = Gtk.SpinButton.new_with_range(-180, 180, 1)
+            self.gif_hue_shift.set_value(self.settings.gif_hue_shift)
+            self.gif_brightness = Gtk.SpinButton.new_with_range(25, 200, 1)
+            self.gif_brightness.set_value(self.settings.gif_brightness_percent)
+            self.gif_speed_source = Gtk.DropDown.new_from_strings(
+                ["Fixed 1×", "CPU load", "GPU load", "Higher of CPU/GPU"]
+            )
+            self.media_gpu_selector = Gtk.DropDown.new_from_strings(gpu_labels)
+            self.media_gpu_selector.set_sensitive(bool(self.gpu_bdfs))
+            self.gif_speed_source.set_selected(
+                {"none": 0, "cpu": 1, "gpu": 2, "max": 3}[
+                    self.settings.gif_speed_source
+                ]
+            )
             self.grid_snap = Gtk.Switch(
                 active=self.settings.snap_to_grid, valign=Gtk.Align.CENTER
             )
@@ -158,6 +260,19 @@ def main() -> None:
             preview_keys.connect("key-pressed", self._delete_key_pressed)
             self.preview.add_controller(preview_keys)
             self.preview.add_css_class("preview-canvas")
+            self.preview_media = Gtk.Stack()
+            self.preview_media.set_size_request(DISPLAY_SIZE, DISPLAY_SIZE)
+            self.preview_media.set_can_target(False)
+            self.preview_media_picture = Gtk.Picture()
+            self.preview_media_picture.set_content_fit(Gtk.ContentFit.COVER)
+            self.preview_media_picture.set_can_shrink(True)
+            self.preview_media.add_named(
+                self.preview_media_picture, "image"
+            )
+            self.preview_media_gif: AnimatedGif | None = None
+            self.preview_media_gif_path: Path | None = None
+            self.preview_media.set_visible(False)
+            self.preview.put(self.preview_media, 0, 0)
             self.preview_grid = Gtk.DrawingArea()
             self.preview_grid.set_content_width(DISPLAY_SIZE)
             self.preview_grid.set_content_height(DISPLAY_SIZE)
@@ -177,7 +292,7 @@ def main() -> None:
                 self.window.present()
                 return
             self.window = Adw.ApplicationWindow(application=self, title="Space Station")
-            self.window.set_default_size(620, 620)
+            self.window.set_default_size(1440, 800)
             font_keys = Gtk.EventControllerKey()
             font_keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
             font_keys.connect("key-pressed", self._preview_font_key)
@@ -185,28 +300,95 @@ def main() -> None:
             self.toast_overlay = Adw.ToastOverlay()
             toolbar = Adw.ToolbarView()
             header = Adw.HeaderBar()
+            sections = self._section_stack()
+            switcher = Adw.ViewSwitcher()
+            switcher.set_policy(Adw.ViewSwitcherPolicy.WIDE)
+            switcher.set_stack(sections)
+            header.set_title_widget(switcher)
             toolbar.add_top_bar(header)
-            toolbar.set_content(self._preferences_page())
+            toolbar.set_content(sections)
             self.toast_overlay.set_child(toolbar)
             self.window.set_content(self.toast_overlay)
             self._install_preview_styles()
             self.window.present()
             self._refresh_status()
             self._refresh_service_status()
+            GLib.timeout_add_seconds(3, self._refresh_openrgb_text_color)
 
         def do_shutdown(self) -> None:
             self.telemetry_stop.set()
-            self.gif_sync_stop.set()
             super().do_shutdown()
 
-        def _preferences_page(self) -> Adw.PreferencesPage:
+        @staticmethod
+        def _preferences_page(
+            *groups: Adw.PreferencesGroup,
+        ) -> Adw.PreferencesPage:
             page = Adw.PreferencesPage()
-            page.add(self._status_group())
-            page.add(self._media_group())
-            page.add(self._display_group())
-            page.add(self._telemetry_group())
-            page.add(self._layout_group())
+            for group in groups:
+                page.add(group)
             return page
+
+        def _section_stack(self) -> Adw.ViewStack:
+            stack = Adw.ViewStack()
+            stack.add_titled(
+                self._preferences_page(self._status_group(), self._display_group()),
+                "device",
+                "Device",
+            )
+            stack.add_titled(
+                self._preferences_page(self._telemetry_group()),
+                "telemetry",
+                "Telemetry",
+            )
+            stack.add_titled(self._layout_page(), "layout", "Layout")
+            stack.set_visible_child_name("layout")
+            return stack
+
+        def _layout_page(self) -> Gtk.Paned:
+            preview_group, layouts_group, controls_group = self._layout_groups()
+            preview_page = self._preferences_page(preview_group)
+            self.widget_controls_page = self._preferences_page(controls_group)
+            self.media_controls_page = self._preferences_page(self._media_group())
+            self.context_controls = Gtk.Stack()
+            self.context_controls.add_named(
+                self.widget_controls_page, "widget"
+            )
+            self.context_controls.add_named(self.media_controls_page, "media")
+            layouts_page = self._preferences_page(layouts_group)
+            self.widgets_page = self._preferences_page(
+                self._layout_widgets_group()
+            )
+            self.widgets_page.set_visible(False)
+            widget_split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            widget_split.set_position(280)
+            widget_split.set_wide_handle(True)
+            widget_split.set_shrink_start_child(False)
+            widget_split.set_shrink_end_child(False)
+            widget_split.set_resize_start_child(False)
+            widget_split.set_resize_end_child(True)
+            widget_split.set_start_child(self.widgets_page)
+            widget_split.set_end_child(preview_page)
+            workspace_split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            workspace_split.set_position(280)
+            workspace_split.set_wide_handle(True)
+            workspace_split.set_shrink_start_child(False)
+            workspace_split.set_shrink_end_child(False)
+            workspace_split.set_resize_start_child(False)
+            workspace_split.set_resize_end_child(True)
+            workspace_split.set_start_child(layouts_page)
+            workspace_split.set_end_child(widget_split)
+            controls_split = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+            controls_split.set_position(1320)
+            controls_split.set_wide_handle(True)
+            controls_split.set_shrink_start_child(False)
+            controls_split.set_shrink_end_child(True)
+            controls_split.set_resize_start_child(True)
+            controls_split.set_resize_end_child(False)
+            controls_split.set_start_child(workspace_split)
+            self.context_controls.set_size_request(120, -1)
+            controls_split.set_end_child(self.context_controls)
+            self.context_controls.set_visible(self.selected_widget >= 0)
+            return controls_split
 
         def _status_group(self) -> Adw.PreferencesGroup:
             group = Adw.PreferencesGroup(title="Device")
@@ -229,15 +411,15 @@ def main() -> None:
 
         def _media_group(self) -> Adw.PreferencesGroup:
             group = Adw.PreferencesGroup(
-                title="Media",
-                description="GIFs are converted to looping H.264 video. Still images occupy the OSD layer.",
+                title="Layout media",
+                description="Choose the background shown beneath this layout. Changes stay in preview until applied.",
             )
-            image = Adw.ActionRow(title="Still image", subtitle="Center-crop and upload a PNG OSD")
+            image = Adw.ActionRow(title="Background image", subtitle="Center-crop and display as a static video background")
             button = Gtk.Button(label="Choose image", valign=Gtk.Align.CENTER)
             button.connect("clicked", lambda *_: self._choose_file("image"))
             image.add_suffix(button)
             group.add(image)
-            animation = Adw.ActionRow(title="Animated GIF", subtitle="Upload as a looping MP4 background")
+            animation = Adw.ActionRow(title="Animated GIF", subtitle="Convert and display as a looping video background")
             button = Gtk.Button(label="Choose GIF", valign=Gtk.Align.CENTER)
             button.connect("clicked", lambda *_: self._choose_file("gif"))
             animation.add_suffix(button)
@@ -255,18 +437,67 @@ def main() -> None:
             self.gif_mask_color.connect(
                 "notify::rgba", lambda *_: self._save_gif_mask_settings()
             )
-            sync = Adw.ActionRow(
-                title="Sync GIF with OpenRGB",
-                subtitle="Re-uploads the last GIF after a stable ARGB_V2_3 color change.",
+            hue = Adw.ActionRow(
+                title="Mask hue shift",
+                subtitle="Rotate the display mask hue from −180° to +180°.",
             )
-            self.gif_sync.connect("notify::active", lambda *_: self._toggle_gif_sync())
-            sync.add_suffix(self.gif_sync)
+            self.gif_hue_shift.connect(
+                "value-changed", lambda *_: self._save_gif_mask_settings()
+            )
+            hue.add_suffix(self.gif_hue_shift)
+            group.add(hue)
+            brightness = Adw.ActionRow(
+                title="Mask brightness",
+                subtitle="Scale display-mask brightness from 25% to 200%.",
+            )
+            self.gif_brightness.connect(
+                "value-changed", lambda *_: self._save_gif_mask_settings()
+            )
+            brightness.add_suffix(self.gif_brightness)
+            group.add(brightness)
+            speed = Adw.ActionRow(
+                title="GIF speed",
+                subtitle="Use ten cached speeds from 1× at 0–10% load to 3× at 91–100%.",
+            )
+            self.gif_speed_source.connect(
+                "notify::selected", lambda *_: self._save_gif_mask_settings()
+            )
+            speed.add_suffix(self.gif_speed_source)
+            group.add(speed)
+            animation_gpu = Adw.ActionRow(
+                title="Animation GPU",
+                subtitle="GPU used when the speed source is GPU load.",
+            )
+            animation_gpu.add_suffix(self.media_gpu_selector)
+            group.add(animation_gpu)
+            self.animation_gpu_row = animation_gpu
+            self.media_gpu_selector.connect(
+                "notify::selected", lambda *_: self._save_gif_mask_settings()
+            )
+            sync = Adw.ActionRow(title="Selected media")
+            self.gif_sync_status_label = Gtk.Label(
+                label=(
+                    "Saved GIF ready"
+                    if self.gif_sync_source is not None
+                    else "Select a GIF"
+                )
+            )
+            sync.add_suffix(self.gif_sync_status_label)
             group.add(sync)
-            clear = Adw.ActionRow(title="Clear foreground overlay", subtitle="Reveal the current video background")
-            button = Gtk.Button(label="Clear", valign=Gtk.Align.CENTER)
-            button.connect("clicked", lambda *_: self._run(self.controller.clear_overlay))
+            clear = Adw.ActionRow(title="Remove layout media")
+            button = Gtk.Button(label="Remove", valign=Gtk.Align.CENTER)
+            button.connect("clicked", lambda *_: self._remove_layout_media())
             clear.add_suffix(button)
             group.add(clear)
+            apply_media = Adw.ActionRow(
+                title="Apply to display",
+                subtitle="Save this layout and restart the Display service with its media.",
+            )
+            button = Gtk.Button(label="Apply", valign=Gtk.Align.CENTER)
+            button.add_css_class("suggested-action")
+            button.connect("clicked", lambda *_: self._apply_layout_media())
+            apply_media.add_suffix(button)
+            group.add(apply_media)
             return group
 
         def _display_group(self) -> Adw.PreferencesGroup:
@@ -284,26 +515,8 @@ def main() -> None:
 
         def _telemetry_group(self) -> Adw.PreferencesGroup:
             group = Adw.PreferencesGroup(
-                title="Native telemetry",
-                description="Renders CPU/GPU readings as a foreground OSD above the current background.",
-            )
-            bdf = Adw.ActionRow(
-                title="GPU",
-                subtitle="Detected PCI display controller used for GPU telemetry",
-            )
-            bdf.add_suffix(self.gpu_selector)
-            group.add(bdf)
-            temperature_unit = Adw.ActionRow(
-                title="Temperature unit",
-                subtitle="Used by telemetry overlays and the live preview",
-            )
-            temperature_unit.add_suffix(self.temperature_unit)
-            group.add(temperature_unit)
-            self.gpu_selector.connect(
-                "notify::selected", lambda *_: self._save_telemetry_settings()
-            )
-            self.temperature_unit.connect(
-                "notify::selected", lambda *_: self._save_telemetry_settings()
+                title="Display runtime",
+                description="Keep the display service running to prevent sleep and manage the background.",
             )
             interval = Adw.ActionRow(title="Refresh interval")
             interval.add_suffix(self.interval)
@@ -315,7 +528,10 @@ def main() -> None:
             self.timeout.connect(
                 "value-changed", lambda *_: self._save_telemetry_settings()
             )
-            row = Adw.ActionRow(title="Telemetry stream")
+            row = Adw.ActionRow(
+                title="Temporary telemetry preview",
+                subtitle="Preview the current in-app layout without changing the saved service layout.",
+            )
             once = Gtk.Button(label="Send once", valign=Gtk.Align.CENTER)
             once.connect("clicked", lambda *_: self._run(self._telemetry_once))
             row.add_suffix(once)
@@ -324,8 +540,8 @@ def main() -> None:
             row.add_suffix(self.telemetry_button)
             group.add(row)
             service = Adw.ActionRow(
-                title="Background overlay service",
-                subtitle="Runs the active saved layout continuously and keeps the display awake.",
+                title="Display service",
+                subtitle="Keep enabled: prevents sleep, restores GIF media, updates adaptive playback, and renders the saved layout.",
             )
             self.service_status_label = Gtk.Label(label="Checking…")
             self.service_status_label.add_css_class("dim-label")
@@ -338,74 +554,149 @@ def main() -> None:
             group.add(service)
             return group
 
-        def _layout_group(self) -> Adw.PreferencesGroup:
-            group = Adw.PreferencesGroup(title="Telemetry layout", description="Drag widgets to position them; drag a selected widget's lower-right handle to resize it. Changes remain in memory until saved.")
-            layout_row = Adw.ActionRow(title="Named layout")
-            self.layout_selector.connect("notify::selected", lambda *_: self._select_layout())
-            layout_row.add_suffix(self.layout_selector)
-            new = Gtk.Button(label="New")
+        def _layout_groups(
+            self,
+        ) -> tuple[
+            Adw.PreferencesGroup,
+            Adw.PreferencesGroup,
+            Adw.PreferencesGroup,
+        ]:
+            preview_group = Adw.PreferencesGroup(title="Telemetry layout", description="Drag widgets to position them; drag a selected widget's lower-right handle to resize it. Changes remain in memory until saved.")
+            layouts_group = Adw.PreferencesGroup(title="Layouts")
+            layout_header = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                spacing=12,
+                margin_bottom=6,
+            )
+            new = Gtk.Button(label="New layout")
             new.connect("clicked", lambda *_: self._new_layout())
-            layout_row.add_suffix(new)
-            add = Gtk.MenuButton(label="Add")
-            add.set_popover(self._add_widget_popover())
-            layout_row.add_suffix(add)
-            self.save_layout_button = Gtk.Button(label="Save layout")
-            self.save_layout_button.set_sensitive(False)
-            self.save_layout_button.connect("clicked", lambda *_: self._save_layouts())
-            layout_row.add_suffix(self.save_layout_button)
-            self.reset_layout_button = Gtk.Button(label="Reset layout")
-            self.reset_layout_button.set_sensitive(False)
-            self.reset_layout_button.connect("clicked", lambda *_: self._reset_layouts())
-            layout_row.add_suffix(self.reset_layout_button)
-            group.add(layout_row)
-            preview_row = Adw.ActionRow(title="Live preview")
-            preview_row.add_suffix(self.preview)
-            group.add(preview_row)
+            new.set_halign(Gtk.Align.START)
+            layout_header.append(new)
+            layouts_group.add(layout_header)
+            layout_scroller = Gtk.ScrolledWindow(
+                hscrollbar_policy=Gtk.PolicyType.NEVER,
+                vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                propagate_natural_height=True,
+                min_content_height=200,
+                max_content_height=520,
+            )
+            layout_scroller.set_child(self.layout_list)
+            layouts_group.add(layout_scroller)
+            self.layout_list.connect("row-selected", self._select_layout)
+
+            preview_box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                halign=Gtk.Align.CENTER,
+            )
+            preview_box.append(self.preview)
+            preview_group.add(preview_box)
             grid_snap = Adw.ActionRow(
                 title="Snap to grid",
                 subtitle=f"Snap placement and graph resizing to {PREVIEW_GRID_SPACING}-pixel grid lines.",
             )
             self.grid_snap.connect("notify::active", lambda *_: self._save_grid_snap())
             grid_snap.add_suffix(self.grid_snap)
-            group.add(grid_snap)
-            controls = Adw.ActionRow(title="Selected widget")
+            preview_group.add(grid_snap)
+            action_bar = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL,
+                spacing=8,
+                margin_top=6,
+            )
+            media = Gtk.Button(label="Media")
+            media.connect("clicked", lambda *_: self._show_media_controls())
+            action_bar.append(media)
+            self.widgets_button = Gtk.ToggleButton(label="Widgets", active=False)
+            self.widgets_button.connect(
+                "toggled", lambda *_: self._toggle_widget_list()
+            )
+            action_bar.append(self.widgets_button)
+            action_spacer = Gtk.Box()
+            action_spacer.set_hexpand(True)
+            action_bar.append(action_spacer)
+            self.reset_layout_button = Gtk.Button(label="Cancel changes")
+            self.reset_layout_button.set_sensitive(False)
+            self.reset_layout_button.connect("clicked", lambda *_: self._reset_layouts())
+            action_bar.append(self.reset_layout_button)
+            self.save_layout_button = Gtk.Button(label="Save")
+            self.save_layout_button.add_css_class("suggested-action")
+            self.save_layout_button.set_sensitive(False)
+            self.save_layout_button.connect("clicked", lambda *_: self._save_layouts())
+            action_bar.append(self.save_layout_button)
+            preview_group.add(action_bar)
+            controls_group = Adw.PreferencesGroup(
+                title="Widget controls",
+                description="Style the widget selected in the adjacent layout-widget list.",
+            )
             self._rebuild_widget_selector(self.selected_widget)
             self.widget_selector.connect("notify::selected", lambda *_: self._select_widget())
-            controls.add_suffix(self.widget_selector)
-            group.add(controls)
+            gpu = Adw.ActionRow(
+                title="GPU",
+                subtitle="Telemetry source for this GPU widget",
+            )
+            gpu.add_suffix(self.gpu_selector)
+            controls_group.add(gpu)
+            self.gpu_row = gpu
+            temperature_unit = Adw.ActionRow(
+                title="Temperature unit",
+                subtitle="Unit for this temperature widget",
+            )
+            temperature_unit.add_suffix(self.temperature_unit)
+            controls_group.add(temperature_unit)
+            self.temperature_unit_row = temperature_unit
+            self.gpu_selector.connect(
+                "notify::selected", lambda *_: self._style_widget()
+            )
+            self.temperature_unit.connect(
+                "notify::selected", lambda *_: self._style_widget()
+            )
             font = Adw.ActionRow(title="Font")
             font.add_suffix(self.font_selector)
-            group.add(font)
+            controls_group.add(font)
             self.font_row = font
             size = Adw.ActionRow(title="Font size")
             size.add_suffix(self.font_size)
-            group.add(size)
+            controls_group.add(size)
             self.font_size_row = size
             width = Adw.ActionRow(title="Graph width")
             width.add_suffix(self.graph_width)
-            group.add(width)
+            controls_group.add(width)
             self.graph_width_row = width
             height = Adw.ActionRow(title="Graph height")
             height.add_suffix(self.graph_height)
-            group.add(height)
+            controls_group.add(height)
             self.graph_height_row = height
             history = Adw.ActionRow(
                 title="Graph history",
                 subtitle="Rolling window in seconds",
             )
             history.add_suffix(self.graph_history_seconds)
-            group.add(history)
+            controls_group.add(history)
             self.graph_history_row = history
             color = Adw.ActionRow(title="Color")
+            color.add_suffix(self.color_source)
             color.add_suffix(self.color)
-            group.add(color)
+            controls_group.add(color)
             self.color_row = color
+            text_hue = Adw.ActionRow(
+                title="OpenRGB hue shift",
+                subtitle="Rotate the matched text hue from −180° to +180°.",
+            )
+            text_hue.add_suffix(self.text_hue_shift)
+            controls_group.add(text_hue)
+            self.text_hue_row = text_hue
+            text_brightness = Adw.ActionRow(
+                title="OpenRGB brightness",
+                subtitle="Scale the matched text brightness from 25% to 200%.",
+            )
+            text_brightness.add_suffix(self.text_brightness)
+            controls_group.add(text_brightness)
+            self.text_brightness_row = text_brightness
             text = Adw.ActionRow(
                 title="Custom text",
                 subtitle="Used only by Custom text widgets",
             )
             text.add_suffix(self.custom_text)
-            group.add(text)
+            controls_group.add(text)
             self.custom_text_row = text
             self.font_selector.connect("notify::selected", lambda *_: self._style_widget())
             self.font_size.connect("value-changed", lambda *_: self._style_widget())
@@ -416,11 +707,20 @@ def main() -> None:
                 "value-changed", lambda *_: self._style_widget("height")
             )
             self.graph_history_seconds.connect("value-changed", lambda *_: self._style_widget())
+            self.color_source.connect(
+                "notify::selected", lambda *_: self._style_widget()
+            )
+            self.text_hue_shift.connect(
+                "value-changed", lambda *_: self._style_widget()
+            )
+            self.text_brightness.connect(
+                "value-changed", lambda *_: self._style_widget()
+            )
             self.color.connect("notify::rgba", lambda *_: self._style_widget())
             self.custom_text.connect("changed", lambda *_: self._style_widget())
             self._refresh_preview()
             self._select_widget()
-            return group
+            return preview_group, layouts_group, controls_group
 
         def _setup_font_item(self, _factory: object, item: object) -> None:
             label = Gtk.Label(xalign=0)
@@ -475,25 +775,169 @@ def main() -> None:
             self.preview_font = font
             self._refresh_preview()
 
-        def _select_layout(self) -> None:
-            if self.resetting_layout:
+        def _rebuild_layout_list(self, selected_name: str) -> None:
+            while row := self.layout_list.get_row_at_index(0):
+                self.layout_list.remove(row)
+            self.layout_list_names = list(self.layouts)
+            for name in self.layout_list_names:
+                row = Gtk.ListBoxRow()
+                content = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL,
+                    spacing=12,
+                    margin_start=8,
+                    margin_end=8,
+                    margin_top=8,
+                    margin_bottom=8,
+                )
+                content.append(self._layout_thumbnail(self.layouts[name]))
+                label = Gtk.Label(
+                    label=name,
+                    xalign=0,
+                    hexpand=True,
+                    valign=Gtk.Align.CENTER,
+                )
+                content.append(label)
+                row.set_child(content)
+                self.layout_list.append(row)
+            if selected_name in self.layout_list_names:
+                self.layout_list.select_row(
+                    self.layout_list.get_row_at_index(
+                        self.layout_list_names.index(selected_name)
+                    )
+                )
+
+        def _layout_thumbnail(self, layout: Layout) -> Gtk.Widget:
+            sample = {
+                "cpu": {"temperature": 42, "load": 37},
+                "gpu": {"temperature": 51, "load": 64},
+                "network": {"upload": 2.4, "download": 15.8},
+            }
+            history = TelemetryHistory()
+            history.add(sample)
+            try:
+                image = render_telemetry_overlay(
+                    sample,
+                    layout,
+                    history,
+                    self.settings.temperature_unit,
+                    self.openrgb_text_color or "#ffffff",
+                )
+                texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(image))
+                picture = Gtk.Picture.new_for_paintable(texture)
+                picture.set_content_fit(Gtk.ContentFit.CONTAIN)
+                picture.set_size_request(104, 104)
+                picture.set_can_shrink(True)
+                picture.set_can_target(False)
+                thumbnail = Gtk.Overlay()
+                thumbnail.set_size_request(104, 104)
+                thumbnail.set_overflow(Gtk.Overflow.HIDDEN)
+                thumbnail.add_css_class("layout-thumbnail")
+                thumbnail.set_child(self._layout_thumbnail_media(layout))
+                thumbnail.add_overlay(picture)
+                return thumbnail
+            except (HidError, OSError, OpenRgbError, ValueError) as exc:
+                unavailable = Gtk.Label(
+                    label="Preview\nunavailable",
+                    justify=Gtk.Justification.CENTER,
+                )
+                unavailable.set_tooltip_text(str(exc))
+                unavailable.set_size_request(104, 104)
+                unavailable.add_css_class("layout-thumbnail")
+                return unavailable
+
+        def _layout_thumbnail_media(self, layout: Layout) -> Gtk.Widget:
+            media = self._effective_layout_media(layout)
+            source = self._preview_media_source(media)
+            if source is None or not source.is_file():
+                return Gtk.Box()
+            if media.kind == "gif":
+                return AnimatedGif(source, 104)
+            if media.kind == "image":
+                picture = Gtk.Picture.new_for_filename(str(source))
+                picture.set_content_fit(Gtk.ContentFit.COVER)
+                picture.set_can_shrink(True)
+                picture.set_can_target(False)
+                return picture
+            return Gtk.Box()
+
+        def _preview_media_source(self, media: LayoutMedia) -> Path | None:
+            source = Path(media.file) if media.file else None
+            if (
+                media.kind != "gif"
+                or source is None
+                or media.gif_mask_mode == "none"
+            ):
+                return source
+            if media.gif_mask_mode == "manual":
+                color = media.gif_mask_color
+            elif media.gif_mask_mode == "openrgb":
+                color = self.openrgb_text_color or argb_v2_3_color()
+                self.openrgb_text_color = color
+            else:
+                raise ValueError(
+                    f"unsupported GIF mask mode: {media.gif_mask_mode}"
+                )
+            adjusted = adjust_mask_color(
+                color,
+                media.gif_hue_shift,
+                media.gif_brightness_percent,
+            )
+            return render_masked_gif_preview(
+                source,
+                adjusted,
+                self.settings_store.path.parent / "media" / "previews",
+            )
+
+        def _refresh_layout_thumbnails(self) -> None:
+            self.resetting_layout = True
+            try:
+                self._rebuild_layout_list(self.layout.name)
+            finally:
+                self.resetting_layout = False
+
+        def _select_layout(
+            self, _layout_list: Gtk.ListBox, row: Gtk.ListBoxRow | None
+        ) -> None:
+            if self.resetting_layout or row is None:
                 return
-            selected = self.layout_selector.get_selected()
-            if selected == Gtk.INVALID_LIST_POSITION or selected >= len(self.layouts):
+            selected = row.get_index()
+            if selected < 0 or selected >= len(self.layout_list_names):
                 return
-            name = list(self.layouts)[selected]
-            if name != self.layout.name and self.layout_draft.dirty:
+            name = self.layout_list_names[selected]
+            changed = name != self.layout.name
+            if changed and self.layout_draft.dirty:
                 self._toast("Unsaved layout changes remain in memory; save to write them to disk.")
             self.layout_draft.select(name, mark_dirty=False)
             self.layout = self.layout_draft.active_layout
+            self.selected_widget = -1
+            self._rebuild_widget_selector(self.selected_widget)
+            self._set_widget_controls_visible(False)
+            self._refresh_preview()
             self.settings.selected_layout = name
             self._save_settings()
-            if (
-                hasattr(self, "gif_sync")
-                and self.gif_mask_mode.get_selected() != 2
-                and self.gif_sync.get_active()
-            ):
-                self.gif_sync.set_active(False)
+            if changed:
+                self._apply_selected_layout(name)
+
+        def _apply_selected_layout(self, name: str) -> None:
+            self.telemetry_stop.set()
+            if self.telemetry_button:
+                self.telemetry_button.set_label("Start")
+            self.layout_apply_generation += 1
+            generation = self.layout_apply_generation
+
+            def apply() -> None:
+                with self.layout_apply_lock:
+                    if generation != self.layout_apply_generation:
+                        return
+                    self.layout_store.save_active(name)
+                    stop_service()
+                    start_service()
+                    GLib.idle_add(self._set_service_status, True)
+                    GLib.idle_add(
+                        self._toast, f"{name} applied to the display"
+                    )
+
+            self._run(apply, success_message=None)
 
         def _save_grid_snap(self) -> None:
             self.settings.snap_to_grid = self.grid_snap.get_active()
@@ -508,11 +952,29 @@ def main() -> None:
             self.layouts[name] = Layout(name, [type(widget)(**vars(widget)) for widget in self.layout.widgets])
             self.layout_draft.select(name)
             self.layout = self.layouts[name]
-            self.layout_selector.set_model(Gtk.StringList.new(list(self.layouts)))
-            self.layout_selector.set_selected(len(self.layouts) - 1)
+            self._rebuild_layout_list(name)
             self.settings.selected_layout = name
             self._save_settings()
             self._mark_layout_dirty()
+
+        def _layout_widgets_group(self) -> Adw.PreferencesGroup:
+            group = Adw.PreferencesGroup(
+                title="Layout widgets",
+                description="Widgets used by the selected layout.",
+            )
+            add = Gtk.MenuButton(label="Add widget", halign=Gtk.Align.START)
+            add.set_popover(self._add_widget_popover())
+            group.add(add)
+            scroller = Gtk.ScrolledWindow(
+                hscrollbar_policy=Gtk.PolicyType.NEVER,
+                vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                min_content_height=300,
+                max_content_height=620,
+            )
+            scroller.set_vexpand(True)
+            scroller.set_child(self.layout_widget_list)
+            group.add(scroller)
+            return group
 
         def _add_widget_popover(self) -> Gtk.Popover:
             labels = {
@@ -527,39 +989,66 @@ def main() -> None:
                 "custom-text": "Custom text",
             }
             popover = Gtk.Popover()
-            stack = Gtk.Stack()
+            catalog = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
 
-            def choices_page(items: list[tuple[str, object]]) -> Gtk.ScrolledWindow:
-                choices = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-                choices.set_size_request(360, -1)
-                for label_text, callback in items:
-                    button = Gtk.Button(label=label_text, halign=Gtk.Align.FILL)
-                    button.set_margin_start(6)
-                    button.set_margin_end(6)
-                    button.connect("clicked", lambda _button, callback=callback: callback())
-                    choices.append(button)
-                scroll = Gtk.ScrolledWindow(min_content_width=360, min_content_height=240, max_content_height=420)
-                scroll.set_child(choices)
-                return scroll
+            def add_section(title: str, items: list[tuple[str, object]]) -> None:
+                heading = Gtk.Label(
+                    label=title,
+                    xalign=0,
+                    margin_start=8,
+                    margin_top=12,
+                    margin_bottom=4,
+                )
+                heading.add_css_class("heading")
+                catalog.append(heading)
+                for label, callback in items:
+                    button = Gtk.Button(
+                        label=label,
+                        halign=Gtk.Align.FILL,
+                        hexpand=True,
+                    )
+                    button.add_css_class("flat")
+                    button.connect(
+                        "clicked",
+                        lambda _button, callback=callback: (
+                            callback(),
+                            popover.popdown(),
+                        ),
+                    )
+                    catalog.append(button)
 
-            type_items: list[tuple[str, object]] = [
-                ("Text value", lambda: stack.set_visible_child_name("text")),
-                *[(f"{style.replace('-', ' ').title()} graph", lambda style=style: stack.set_visible_child_name(style)) for style in GRAPH_STYLES],
-                ("Custom text", lambda: (self._add_widget("custom-text"), popover.popdown())),
-            ]
-            stack.add_named(choices_page(type_items), "types")
-            text_metrics = [
-                (labels[metric], lambda metric=metric: (self._add_widget(metric), popover.popdown()))
-                for metric in WIDGETS if metric != "custom-text"
-            ]
-            stack.add_named(choices_page([("← Back", lambda: stack.set_visible_child_name("types")), *text_metrics]), "text")
+            add_section(
+                "Text",
+                [
+                    (
+                        labels[metric],
+                        lambda metric=metric: self._add_widget(metric),
+                    )
+                    for metric in WIDGETS
+                ],
+            )
             for style in GRAPH_STYLES:
-                metrics = [
-                    (labels[metric], lambda metric=metric, style=style: (self._add_widget(metric, graph_style=style), popover.popdown()))
-                    for metric in GRAPH_METRICS
-                ]
-                stack.add_named(choices_page([("← Back", lambda: stack.set_visible_child_name("types")), *metrics]), style)
-            popover.set_child(stack)
+                add_section(
+                    style.replace("-", " ").title(),
+                    [
+                        (
+                            labels[metric],
+                            lambda metric=metric, style=style: self._add_widget(
+                                metric, graph_style=style
+                            ),
+                        )
+                        for metric in GRAPH_METRICS
+                    ],
+                )
+            scroller = Gtk.ScrolledWindow(
+                hscrollbar_policy=Gtk.PolicyType.NEVER,
+                vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+                min_content_width=280,
+                min_content_height=320,
+                max_content_height=560,
+            )
+            scroller.set_child(catalog)
+            popover.set_child(scroller)
             return popover
 
         def _add_widget(self, metric: str, graph_style: str | None = None) -> None:
@@ -589,10 +1078,26 @@ def main() -> None:
             if selected == Gtk.INVALID_LIST_POSITION or selected >= len(self.layout.widgets):
                 return
             self.selected_widget = selected
+            self._set_widget_controls_visible(True)
             widget = self.layout.widgets[self.selected_widget]
             self.preview_font = None
             self.updating_layout_controls = True
             try:
+                self.layout_widget_list.select_row(
+                    self.layout_widget_list.get_row_at_index(self.selected_widget)
+                )
+                selected_gpu_bdf = widget.gpu_bdf or self.settings.gpu_bdf
+                self.gpu_selector.set_selected(
+                    self.gpu_bdfs.index(selected_gpu_bdf)
+                    if selected_gpu_bdf in self.gpu_bdfs
+                    else Gtk.INVALID_LIST_POSITION
+                )
+                self.temperature_unit.set_selected(
+                    1
+                    if (widget.temperature_unit or self.settings.temperature_unit)
+                    == "F"
+                    else 0
+                )
                 self.font_selector.set_selected(
                     self.fonts.index(widget.font)
                     if widget.font in self.fonts
@@ -605,21 +1110,88 @@ def main() -> None:
                 rgba = Gdk.RGBA()
                 rgba.parse(widget.color)
                 self.color.set_rgba(rgba)
+                self.color_source.set_selected(
+                    1 if widget.color_source == "openrgb" else 0
+                )
+                self.text_hue_shift.set_value(widget.color_hue_shift)
+                self.text_brightness.set_value(
+                    widget.color_brightness_percent
+                )
                 self.custom_text.set_text(widget.text)
             finally:
                 self.updating_layout_controls = False
             self._update_editor_visibility(widget)
             self._refresh_preview()
 
+        def _select_layout_widget(
+            self, _widget_list: Gtk.ListBox, row: Gtk.ListBoxRow | None
+        ) -> None:
+            if self.updating_layout_controls or row is None:
+                return
+            index = row.get_index()
+            if 0 <= index < len(self.layout.widgets):
+                self.selected_widget = index
+                self.widget_selector.set_selected(index)
+                self._select_widget()
+
+        def _rebuild_layout_widget_list(
+            self, labels: list[str], selected: int
+        ) -> None:
+            while row := self.layout_widget_list.get_row_at_index(0):
+                self.layout_widget_list.remove(row)
+            for label_text in labels:
+                row = Gtk.ListBoxRow()
+                label = Gtk.Label(
+                    label=label_text,
+                    xalign=0,
+                    margin_start=12,
+                    margin_end=12,
+                    margin_top=10,
+                    margin_bottom=10,
+                )
+                row.set_child(label)
+                self.layout_widget_list.append(row)
+            if labels and selected >= 0:
+                self.layout_widget_list.select_row(
+                    self.layout_widget_list.get_row_at_index(selected)
+                )
+
+        def _set_widget_controls_visible(self, visible: bool) -> None:
+            if hasattr(self, "context_controls"):
+                if visible:
+                    self.context_controls.set_visible_child_name("widget")
+                self.context_controls.set_visible(visible)
+
+        def _show_media_controls(self) -> None:
+            self._load_layout_media_controls()
+            self.context_controls.set_visible_child_name("media")
+            self.context_controls.set_visible(True)
+
+        def _toggle_widget_list(self) -> None:
+            if hasattr(self, "widgets_page"):
+                self.widgets_page.set_visible(
+                    self.widgets_button.get_active()
+                )
+
         def _update_editor_visibility(self, widget: Widget) -> None:
             is_graph = widget.is_graph
             is_custom_text = widget.metric == "custom-text"
+            self.gpu_row.set_visible(widget.metric.startswith("gpu-"))
+            self.temperature_unit_row.set_visible(
+                widget.metric.endswith("temperature")
+            )
             self.font_row.set_visible(not is_graph)
             self.font_size_row.set_visible(not is_graph)
             self.graph_width_row.set_visible(is_graph)
             self.graph_height_row.set_visible(is_graph)
             self.graph_history_row.set_visible(is_graph)
+            self.color_source.set_visible(not is_graph)
             self.color_row.set_visible(True)
+            matches_openrgb = (
+                not is_graph and self.color_source.get_selected() == 1
+            )
+            self.text_hue_row.set_visible(matches_openrgb)
+            self.text_brightness_row.set_visible(matches_openrgb)
             self.custom_text_row.set_visible(is_custom_text)
 
         def _style_widget(self, changed_dimension: str | None = None) -> None:
@@ -637,6 +1209,14 @@ def main() -> None:
                 round(rgba.blue * 255),
             )
             widget.font, widget.size, widget.color, widget.text = self.fonts[selected_font], int(self.font_size.get_value()), color, self.custom_text.get_text()
+            if not widget.is_graph:
+                widget.color_source = (
+                    "openrgb" if self.color_source.get_selected() == 1 else "manual"
+                )
+                widget.color_hue_shift = self.text_hue_shift.get_value()
+                widget.color_brightness_percent = (
+                    self.text_brightness.get_value()
+                )
             width = int(self.graph_width.get_value())
             height = int(self.graph_height.get_value())
             if widget.is_circular_graph:
@@ -652,11 +1232,23 @@ def main() -> None:
             else:
                 widget.width, widget.height = width, height
             widget.history_seconds = int(self.graph_history_seconds.get_value())
+            selected_gpu = self.gpu_selector.get_selected()
+            if widget.metric.startswith("gpu-"):
+                widget.gpu_bdf = (
+                    self.gpu_bdfs[selected_gpu]
+                    if selected_gpu != Gtk.INVALID_LIST_POSITION
+                    and selected_gpu < len(self.gpu_bdfs)
+                    else ""
+                )
+            if widget.metric.endswith("temperature"):
+                widget.temperature_unit = self._selected_temperature_unit()
+            self._update_editor_visibility(widget)
             self._mark_layout_dirty()
             self._refresh_preview()
 
         def _refresh_preview(self) -> None:
             self._clear_interaction_ghost()
+            self._refresh_media_preview()
             for label in self.preview_labels:
                 self.preview.remove(label)
             self.preview_labels = []
@@ -664,12 +1256,12 @@ def main() -> None:
             samples = {
                 "cpu-temperature": (
                     "CPU Temperature",
-                    format_temperature(42, self._selected_temperature_unit()),
+                    "",
                 ),
                 "cpu-load": ("CPU Load", "17%"),
                 "gpu-temperature": (
                     "GPU Temperature",
-                    format_temperature(50, self._selected_temperature_unit()),
+                    "",
                 ),
                 "gpu-load": ("GPU Load", "8%"),
                 "network-upload": ("Network Upload", "UP 2.4 KB/s"),
@@ -683,6 +1275,11 @@ def main() -> None:
                     if widget.metric == "custom-text"
                     else samples[widget.metric]
                 )
+                if widget.metric.endswith("temperature"):
+                    sample = format_temperature(
+                        42 if widget.metric.startswith("cpu-") else 50,
+                        widget.temperature_unit or self.settings.temperature_unit,
+                    )
                 if widget.is_graph:
                     name = (
                         f"{name} · {widget.graph_style.replace('-', ' ')}"
@@ -701,8 +1298,18 @@ def main() -> None:
                         if index == self.selected_widget and self.preview_font is not None
                         else widget.font
                     )
+                    preview_color = (
+                        adjust_mask_color(
+                            self.openrgb_text_color,
+                            widget.color_hue_shift,
+                            widget.color_brightness_percent,
+                        )
+                        if widget.color_source == "openrgb"
+                        and self.openrgb_text_color is not None
+                        else widget.color
+                    )
                     value.set_markup(
-                        f'<span foreground="{widget.color}" font_desc="{font} {widget.size}">{sample}</span>'
+                        f'<span foreground="{preview_color}" font_desc="{font} {widget.size}">{sample}</span>'
                     )
                 value.add_css_class("preview-widget")
                 if index == self.selected_widget:
@@ -746,22 +1353,86 @@ def main() -> None:
                 self.preview_labels.append(container)
                 self.preview_values.append(value)
 
+        def _refresh_media_preview(self) -> None:
+            media = self._effective_layout_media()
+            try:
+                source = self._preview_media_source(media)
+            except Exception as exc:
+                self.preview_media.set_visible(False)
+                self._toast(str(exc))
+                return
+            if (
+                media.kind in {"image", "gif"}
+                and source is not None
+                and source.is_file()
+            ):
+                if media.kind == "gif":
+                    if source != self.preview_media_gif_path:
+                        if self.preview_media_gif is not None:
+                            self.preview_media.remove(self.preview_media_gif)
+                        self.preview_media_gif = AnimatedGif(
+                            source, DISPLAY_SIZE
+                        )
+                        self.preview_media.add_named(
+                            self.preview_media_gif, "gif"
+                        )
+                        self.preview_media_gif_path = source
+                    self.preview_media.set_visible_child_name("gif")
+                else:
+                    self.preview_media_picture.set_filename(str(source))
+                    self.preview_media.set_visible_child_name("image")
+                self.preview_media.set_visible(True)
+            else:
+                self.preview_media.set_visible(False)
+
+        def _refresh_openrgb_text_color(self) -> bool:
+            uses_text_color = any(
+                not widget.is_graph and widget.color_source == "openrgb"
+                for widget in self.layout.widgets
+            )
+            uses_media_mask = any(
+                self._effective_layout_media(layout).gif_mask_mode == "openrgb"
+                and self._effective_layout_media(layout).kind == "gif"
+                for layout in self.layouts.values()
+            )
+            if not uses_text_color and not uses_media_mask:
+                return True
+            try:
+                color = argb_v2_3_color()
+            except OpenRgbError as exc:
+                message = str(exc)
+                if message != self.openrgb_text_error:
+                    self.openrgb_text_error = message
+                    self._toast(message)
+                return True
+            self.openrgb_text_error = None
+            if color != self.openrgb_text_color:
+                self.openrgb_text_color = color
+                self._refresh_preview()
+                self._refresh_layout_thumbnails()
+            return True
+
         def _rebuild_widget_selector(self, selected: int | None = None) -> bool:
+            requested = self.selected_widget if selected is None else selected
             labels, selected_widget = widget_selector_state(
                 self.layout.widgets,
-                self.selected_widget if selected is None else selected,
+                requested,
             )
+            if requested < 0:
+                selected_widget = -1
             self.updating_layout_controls = True
             try:
                 self.widget_selector.set_model(Gtk.StringList.new(labels))
-                if labels:
+                if labels and selected_widget >= 0:
                     self.selected_widget = selected_widget
                     self.widget_selector.set_selected(self.selected_widget)
                 else:
                     self.selected_widget = -1
                     self.widget_selector.set_selected(Gtk.INVALID_LIST_POSITION)
+                self._rebuild_layout_widget_list(labels, self.selected_widget)
             finally:
                 self.updating_layout_controls = False
+            self._set_widget_controls_visible(self.selected_widget >= 0)
             return bool(labels)
 
         def _preview_graph(self, widget: object) -> Gtk.DrawingArea:
@@ -875,8 +1546,10 @@ def main() -> None:
             provider = Gtk.CssProvider()
             provider.load_from_string(
                 f".preview-canvas {{ min-width: {DISPLAY_SIZE}px; min-height: {DISPLAY_SIZE}px; "
-                f"max-width: {DISPLAY_SIZE}px; max-height: {DISPLAY_SIZE}px; "
                 "background-color: alpha(#1e1e1e, 0.35); }"
+                ".layout-thumbnail { background-color: #101010; border: 1px solid alpha(#ffffff, 0.15); "
+                "border-radius: 8px; padding: 2px; }"
+                ".layout-widget-list row:selected { background-color: alpha(#3584e4, 0.28); }"
                 ".preview-widget { padding: 0; border: 0 solid transparent; }"
                 ".preview-widget-title { font-size: 10px; color: #9a9996; }"
                 ".preview-selected { background-color: alpha(#3584e4, 0.2); }"
@@ -1048,6 +1721,7 @@ def main() -> None:
             if not self.layout_draft.dirty:
                 return
             self.layout_draft.save()
+            self._rebuild_layout_list(self.layout.name)
             if self.save_layout_button:
                 self.save_layout_button.set_sensitive(False)
             if self.reset_layout_button:
@@ -1062,10 +1736,7 @@ def main() -> None:
                 self.layout_draft.reset()
                 self.layouts = self.layout_draft.layouts
                 self.layout = self.layout_draft.active_layout
-                self.layout_selector.set_model(Gtk.StringList.new(list(self.layouts)))
-                self.layout_selector.set_selected(
-                    list(self.layouts).index(self.layout.name)
-                )
+                self._rebuild_layout_list(self.layout.name)
             finally:
                 self.resetting_layout = False
             self.selected_widget = 0
@@ -1086,26 +1757,95 @@ def main() -> None:
                 self.reset_layout_button.set_sensitive(True)
 
         def _save_telemetry_settings(self) -> None:
-            if self.gpu_bdfs:
-                selected = self.gpu_selector.get_selected()
-                if selected != Gtk.INVALID_LIST_POSITION and selected < len(self.gpu_bdfs):
-                    self.settings.gpu_bdf = self.gpu_bdfs[selected]
             self.settings.refresh_interval = self.interval.get_value()
             self.settings.sleep_timeout = int(self.timeout.get_value())
-            self.settings.temperature_unit = self._selected_temperature_unit()
             self._save_settings()
 
+        def _effective_layout_media(
+            self, layout: Layout | None = None
+        ) -> LayoutMedia:
+            media = (layout or self.layout).media
+            if media.kind != "inherit":
+                return media
+            retained = self.settings_store.saved_gif()
+            return LayoutMedia(
+                kind="gif" if retained else "none",
+                file=str(retained) if retained else "",
+                gif_mask_mode=self.settings.gif_mask_mode,
+                gif_mask_color=self.settings.gif_mask_color,
+                gif_speed_source=self.settings.gif_speed_source,
+                gif_speed_gpu_bdf=self.settings.gpu_bdf,
+                gif_hue_shift=self.settings.gif_hue_shift,
+                gif_brightness_percent=self.settings.gif_brightness_percent,
+            )
+
+        def _materialize_layout_media(self) -> LayoutMedia:
+            if self.layout.media.kind == "inherit":
+                self.layout.media = self._effective_layout_media()
+            return self.layout.media
+
+        def _load_layout_media_controls(self) -> None:
+            media = self._effective_layout_media()
+            self.updating_media_controls = True
+            self.gif_mask_mode.set_selected(
+                ("none", "manual", "openrgb").index(media.gif_mask_mode)
+            )
+            rgba = Gdk.RGBA()
+            if rgba.parse(media.gif_mask_color):
+                self.gif_mask_color.set_rgba(rgba)
+            self.gif_speed_source.set_selected(
+                ("none", "cpu", "gpu", "max").index(media.gif_speed_source)
+            )
+            selected_gpu = media.gif_speed_gpu_bdf or self.settings.gpu_bdf
+            self.media_gpu_selector.set_selected(
+                self.gpu_bdfs.index(selected_gpu)
+                if selected_gpu in self.gpu_bdfs
+                else Gtk.INVALID_LIST_POSITION
+            )
+            self.animation_gpu_row.set_visible(
+                media.gif_speed_source == "gpu"
+            )
+            self.gif_hue_shift.set_value(media.gif_hue_shift)
+            self.gif_brightness.set_value(media.gif_brightness_percent)
+            self.updating_media_controls = False
+            selected = Path(media.file).name if media.file else "None"
+            self.gif_sync_status_label.set_text(
+                f"{media.kind.upper()}: {selected}"
+                if media.kind in {"image", "gif"} and media.file
+                else "None"
+            )
+
         def _save_gif_mask_settings(self) -> None:
-            self.settings.gif_mask_mode = ("none", "manual", "openrgb")[
+            if self.updating_media_controls:
+                return
+            media = self._materialize_layout_media()
+            media.gif_mask_mode = ("none", "manual", "openrgb")[
                 self.gif_mask_mode.get_selected()
             ]
             rgba = self.gif_mask_color.get_rgba()
-            self.settings.gif_mask_color = "#{:02x}{:02x}{:02x}".format(
+            media.gif_mask_color = "#{:02x}{:02x}{:02x}".format(
                 round(rgba.red * 255),
                 round(rgba.green * 255),
                 round(rgba.blue * 255),
             )
-            self._save_settings()
+            media.gif_speed_source = ("none", "cpu", "gpu", "max")[
+                self.gif_speed_source.get_selected()
+            ]
+            selected_gpu = self.media_gpu_selector.get_selected()
+            media.gif_speed_gpu_bdf = (
+                self.gpu_bdfs[selected_gpu]
+                if selected_gpu != Gtk.INVALID_LIST_POSITION
+                and selected_gpu < len(self.gpu_bdfs)
+                else ""
+            )
+            self.animation_gpu_row.set_visible(
+                media.gif_speed_source == "gpu"
+            )
+            media.gif_hue_shift = self.gif_hue_shift.get_value()
+            media.gif_brightness_percent = self.gif_brightness.get_value()
+            self._refresh_preview()
+            self._refresh_layout_thumbnails()
+            self._mark_layout_dirty()
 
         def _gif_mask_color(self) -> str | None:
             mode = self.gif_mask_mode.get_selected()
@@ -1119,57 +1859,6 @@ def main() -> None:
                     round(rgba.blue * 255),
                 )
             return argb_v2_3_color()
-
-        def _toggle_gif_sync(self) -> None:
-            if not self.gif_sync.get_active():
-                self.gif_sync_stop.set()
-                return
-            if self.gif_mask_mode.get_selected() != 2:
-                self.gif_sync.set_active(False)
-                self._toast("Select OpenRGB ARGB_V2_3 before enabling GIF sync")
-                return
-            if self.gif_sync_source is None or self.gif_sync_color is None:
-                self.gif_sync.set_active(False)
-                self._toast("Upload a GIF with the OpenRGB mask before enabling sync")
-                return
-            if service_active():
-                self.gif_sync.set_active(False)
-                self._toast("Stop the background telemetry service before syncing GIF media")
-                return
-            self.gif_sync_stop.set()
-            self.gif_sync_stop = threading.Event()
-            threading.Thread(
-                target=self._gif_sync_loop,
-                args=(self.gif_sync_source, self.gif_sync_color, self.gif_sync_stop),
-                daemon=True,
-            ).start()
-
-        def _gif_sync_loop(
-            self, source: Path, applied_color: str, stop: threading.Event
-        ) -> None:
-            pending_color: str | None = None
-            while not stop.wait(3):
-                try:
-                    color = argb_v2_3_color()
-                    if color == applied_color:
-                        pending_color = None
-                        continue
-                    if color != pending_color:
-                        pending_color = color
-                        continue
-                    if service_active():
-                        GLib.idle_add(
-                            self._toast,
-                            "GIF sync paused while the background telemetry service is running",
-                        )
-                        continue
-                    self.controller.show_animation(source, color)
-                    applied_color = color
-                    pending_color = None
-                    GLib.idle_add(self._toast, "Updated GIF color from OpenRGB")
-                except Exception as exc:
-                    pending_color = None
-                    GLib.idle_add(self._toast, f"GIF sync failed: {exc}")
 
         def _save_settings(self) -> None:
             try:
@@ -1189,21 +1878,42 @@ def main() -> None:
                 if response == Gtk.ResponseType.ACCEPT and (selected := dialog.get_file()):
                     path = selected.get_path()
                     if path:
-                        if kind == "image":
-                            self._run(lambda: self.controller.show_image(Path(path)))
-                        else:
-                            self._run(lambda: self._show_animation(Path(path)))
+                        self._set_layout_media(Path(path), kind)
             finally:
                 dialog.destroy()
 
-        def _show_animation(self, source: Path) -> None:
-            color = self._gif_mask_color()
-            self.controller.show_animation(source, color)
-            if color is not None and self.gif_mask_mode.get_selected() == 2:
-                self.gif_sync_source = source
-                self.gif_sync_color = color
-                if self.gif_sync.get_active():
-                    GLib.idle_add(self._toggle_gif_sync)
+        def _set_layout_media(self, source: Path, kind: str) -> None:
+            media_dir = self.settings_store.path.parent / "media" / "layouts"
+            media_dir.mkdir(parents=True, exist_ok=True)
+            target = media_dir / f"{uuid4().hex}{source.suffix.lower()}"
+            shutil.copy2(source, target)
+            media = self._materialize_layout_media()
+            media.kind = kind
+            media.file = str(target)
+            self._save_gif_mask_settings()
+            self._load_layout_media_controls()
+            self._refresh_preview()
+            self._refresh_layout_thumbnails()
+            self._mark_layout_dirty()
+
+        def _remove_layout_media(self) -> None:
+            media = self._materialize_layout_media()
+            media.kind = "none"
+            media.file = ""
+            self._load_layout_media_controls()
+            self._refresh_preview()
+            self._refresh_layout_thumbnails()
+            self._mark_layout_dirty()
+
+        def _apply_layout_media(self) -> None:
+            self._save_gif_mask_settings()
+            self._save_layouts()
+
+            def apply() -> None:
+                stop_service()
+                start_service()
+
+            self._run(apply, "Layout media applied")
 
         def _wake(self) -> None:
             self.controller.wake(int(self.timeout.get_value()))
@@ -1213,12 +1923,12 @@ def main() -> None:
 
         def _telemetry_once(self) -> None:
             iterator = self.controller.telemetry_updates(
-                self._selected_gpu_bdf(),
+                self.settings.gpu_bdf,
                 self.interval.get_value(),
                 lambda: False,
                 overlay=True,
                 layout=self.layout,
-                temperature_unit=self._selected_temperature_unit(),
+                temperature_unit=self.settings.temperature_unit,
             )
             next(iterator)
 
@@ -1236,12 +1946,12 @@ def main() -> None:
         def _telemetry_loop(self) -> None:
             try:
                 for _ in self.controller.telemetry_updates(
-                    self._selected_gpu_bdf(),
+                    self.settings.gpu_bdf,
                     self.interval.get_value(),
                     self.telemetry_stop.is_set,
                     overlay=True,
                     layout=self.layout,
-                    temperature_unit=self._selected_temperature_unit(),
+                    temperature_unit=self.settings.temperature_unit,
                 ):
                     pass
             finally:
@@ -1282,12 +1992,6 @@ def main() -> None:
             if self.service_button:
                 self.service_button.set_label("Stop" if active else "Start")
 
-        def _selected_gpu_bdf(self) -> str:
-            selected = self.gpu_selector.get_selected()
-            if selected == Gtk.INVALID_LIST_POSITION or selected >= len(self.gpu_bdfs):
-                raise ValueError("no PCI display controller is available for telemetry")
-            return self.gpu_bdfs[selected]
-
         def _selected_temperature_unit(self) -> str:
             return "F" if self.temperature_unit.get_selected() == 1 else "C"
 
@@ -1326,4 +2030,5 @@ def main() -> None:
             if self.toast_overlay:
                 self.toast_overlay.add_toast(Adw.Toast.new(message))
 
+    Gtk.init()
     SpaceStationApplication().run(None)

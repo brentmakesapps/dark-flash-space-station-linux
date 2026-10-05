@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-import subprocess
+import hashlib
+import math
 import re
+import subprocess
 import tempfile
 import time
 from datetime import datetime
@@ -14,6 +16,7 @@ from pathlib import Path
 
 from .hid import Device, HidError
 from .layout import Layout, default_layout
+from .openrgb import adjust_mask_color
 from .telemetry import TelemetryHistory
 from .protocol import (
     MEDIA_BLOCK_SIZE,
@@ -23,6 +26,7 @@ from .protocol import (
 )
 
 DISPLAY_CONTENT_INSET = 24
+GIF_PREVIEW_CACHE_LIMIT = 32
 IMAGE_MAGICK_FONTS = {
     "Liberation Sans": "Liberation-Sans",
     "DejaVu Sans": "DejaVu-Sans",
@@ -133,9 +137,14 @@ def _graph_values(
 ) -> list[float]:
     metric = widget.metric
     seconds = max(1, int(widget.history_seconds))
-    values = history.values(metric, seconds) if history is not None else []
+    history_metric = (
+        f"{metric}@{widget.gpu_bdf}"
+        if metric.startswith("gpu-") and widget.gpu_bdf
+        else metric
+    )
+    values = history.values(history_metric, seconds) if history is not None else []
     if values:
-        return values
+        return _temperature_graph_values(widget, values)
     section, field = {
         "cpu-temperature": ("cpu", "temperature"),
         "cpu-load": ("cpu", "load"),
@@ -144,13 +153,41 @@ def _graph_values(
         "network-upload": ("network", "upload"),
         "network-download": ("network", "download"),
     }[metric]
-    source = telemetry.get(section)
+    source = (
+        _widget_gpu_telemetry(widget, telemetry)
+        if section == "gpu"
+        else telemetry.get(section)
+    )
     value = source.get(field, 0) if isinstance(source, Mapping) else 0
-    return [float(value)] if isinstance(value, (int, float)) else [0]
+    values = [float(value)] if isinstance(value, (int, float)) else [0]
+    return _temperature_graph_values(widget, values)
 
 
-def _graph_scale(metric: str, values: list[float]) -> float:
-    if metric.endswith(("temperature", "load")):
+def _widget_gpu_telemetry(
+    widget: object, telemetry: Mapping[str, object]
+) -> object:
+    gpus = telemetry.get("gpus")
+    gpu_bdf = getattr(widget, "gpu_bdf", "")
+    if gpu_bdf and isinstance(gpus, Mapping):
+        selected = gpus.get(gpu_bdf)
+        if isinstance(selected, Mapping):
+            return selected
+    return telemetry.get("gpu", {})
+
+
+def _temperature_graph_values(widget: object, values: list[float]) -> list[float]:
+    if (
+        widget.metric.endswith("temperature")
+        and getattr(widget, "temperature_unit", "") == "F"
+    ):
+        return [value * 9 / 5 + 32 for value in values]
+    return values
+
+
+def _graph_scale(widget: object, values: list[float]) -> float:
+    if widget.metric.endswith("temperature"):
+        return 212 if getattr(widget, "temperature_unit", "") == "F" else 100
+    if widget.metric.endswith("load"):
         return 100
     return max(max(values, default=0), 1)
 
@@ -163,7 +200,7 @@ def _graph_draw(widget: object, values: list[float]) -> list[str]:
     )
     width, height = max(20, int(widget.width)), max(20, int(widget.height))
     color, style = widget.color, widget.graph_style
-    scale = _graph_scale(widget.metric, values)
+    scale = _graph_scale(widget, values)
     normalized = [max(0, min(1, value / scale)) for value in values]
     if style == "bar":
         bar_width = max(1, width / max(len(normalized), 1))
@@ -260,6 +297,7 @@ def render_telemetry_overlay(
     layout: Layout | None = None,
     history: TelemetryHistory | None = None,
     temperature_unit: str = "C",
+    openrgb_color: str | None = None,
 ) -> bytes:
     """Render text and rolling-history graph widgets into a transparent foreground OSD."""
     cpu = telemetry.get("cpu", {})
@@ -268,25 +306,51 @@ def render_telemetry_overlay(
     if not isinstance(cpu, Mapping) or not isinstance(gpu, Mapping) or not isinstance(network, Mapping):
         raise ValueError("telemetry payload does not contain CPU and GPU data")
     now = datetime.now()
-    values = {
-        "cpu-temperature": format_temperature(cpu.get("temperature", 0), temperature_unit),
-        "cpu-load": f"{cpu.get('load', 0)}%",
-        "gpu-temperature": format_temperature(gpu.get("temperature", 0), temperature_unit),
-        "gpu-load": f"{gpu.get('load', 0)}%",
-        "network-upload": f"{network.get('upload', 0)} KB/s",
-        "network-download": f"{network.get('download', 0)} KB/s",
-        "time": now.strftime("%H:%M"),
-        "date": now.strftime("%Y-%m-%d"),
-    }
     layout = layout or default_layout()
     arguments = ["convert", "-size", "320x320", "xc:none"]
     for widget in layout.widgets:
         if widget.is_graph:
             arguments.extend(_graph_draw(widget, _graph_values(widget, telemetry, history)))
         else:
+            color = widget.color
+            if getattr(widget, "color_source", "manual") == "openrgb":
+                if openrgb_color is None:
+                    raise ValueError(
+                        "OpenRGB text color was requested but no color was provided"
+                    )
+                color = adjust_mask_color(
+                    openrgb_color,
+                    widget.color_hue_shift,
+                    widget.color_brightness_percent,
+                )
+            widget_gpu = _widget_gpu_telemetry(widget, telemetry)
+            widget_unit = widget.temperature_unit or temperature_unit
+            values = {
+                "cpu-temperature": format_temperature(
+                    cpu.get("temperature", 0), widget_unit
+                ),
+                "cpu-load": f"{cpu.get('load', 0)}%",
+                "gpu-temperature": format_temperature(
+                    (
+                        widget_gpu.get("temperature", 0)
+                        if isinstance(widget_gpu, Mapping)
+                        else 0
+                    ),
+                    widget_unit,
+                ),
+                "gpu-load": (
+                    f"{widget_gpu.get('load', 0)}%"
+                    if isinstance(widget_gpu, Mapping)
+                    else "0%"
+                ),
+                "network-upload": f"{network.get('upload', 0)} KB/s",
+                "network-download": f"{network.get('download', 0)} KB/s",
+                "time": now.strftime("%H:%M"),
+                "date": now.strftime("%Y-%m-%d"),
+            }
             arguments.extend((
                 "-font", image_magick_font(widget.font),
-                "-fill", widget.color,
+                "-fill", color,
                 "-pointsize", str(widget.size),
                 "-gravity", "northwest",
                 "-annotate",
@@ -303,10 +367,15 @@ def render_telemetry_overlay(
     return result.stdout
 
 
-def render_animation(source: Path, mask_color: str | None = None) -> bytes:
+def render_animation(
+    source: Path, mask_color: str | None = None, *, speed: float = 1.0
+) -> bytes:
     """Render a GIF as the display's native 320x320 H.264 MP4 media format."""
     if mask_color is not None and re.fullmatch(r"#[0-9a-fA-F]{6}", mask_color) is None:
         raise ValueError("GIF mask color must be a six-digit hex color")
+    if not math.isfinite(speed) or speed <= 0:
+        raise ValueError("GIF playback speed must be a positive finite number")
+    timing_filter = f",setpts=PTS/{speed:.6f}"
     with tempfile.NamedTemporaryFile(suffix=".mp4") as output:
         try:
             filter_arguments = (
@@ -317,7 +386,8 @@ def render_animation(source: Path, mask_color: str | None = None) -> bytes:
                         "crop=320:320,format=gray,format=rgb24,"
                         f"lutrgb=r='val*{int(mask_color[1:3], 16)}/255':"
                         f"g='val*{int(mask_color[3:5], 16)}/255':"
-                        f"b='val*{int(mask_color[5:7], 16)}/255'[video]"
+                        f"b='val*{int(mask_color[5:7], 16)}/255'"
+                        f"{timing_filter}[video]"
                     ),
                     "-map",
                     "[video]",
@@ -325,7 +395,10 @@ def render_animation(source: Path, mask_color: str | None = None) -> bytes:
                 if mask_color is not None
                 else [
                     "-vf",
-                    "scale=320:320:force_original_aspect_ratio=increase,crop=320:320",
+                    (
+                        "scale=320:320:force_original_aspect_ratio=increase,"
+                        f"crop=320:320{timing_filter}"
+                    ),
                 ]
             )
             subprocess.run(
@@ -334,6 +407,8 @@ def render_animation(source: Path, mask_color: str | None = None) -> bytes:
                     "-v",
                     "error",
                     "-y",
+                    "-stream_loop",
+                    "9",
                     "-i",
                     str(source),
                     *filter_arguments,
@@ -363,6 +438,125 @@ def render_animation(source: Path, mask_color: str | None = None) -> bytes:
             )
         except (OSError, subprocess.CalledProcessError) as exc:
             raise HidError(f"unable to render animation {source}: {exc}") from exc
+        return Path(output.name).read_bytes()
+
+
+def render_background_image(source: Path) -> bytes:
+    """Render a still image as a looping-compatible H.264 background."""
+    return _render_static_background(["-loop", "1", "-i", str(source)], source)
+
+
+def render_blank_background() -> bytes:
+    """Render a black video background that effectively removes selected media."""
+    return _render_static_background(
+        ["-f", "lavfi", "-i", "color=c=black:s=320x320:r=20"],
+        "blank background",
+    )
+
+
+def render_masked_gif_preview(
+    source: Path, mask_color: str, directory: Path
+) -> Path:
+    """Cache an animated GIF tinted with the effective display mask color."""
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", mask_color) is None:
+        raise ValueError("GIF preview mask color must be a six-digit hex color")
+    try:
+        modified = source.stat().st_mtime_ns
+    except OSError as exc:
+        raise HidError(f"unable to read GIF preview source {source}: {exc}") from exc
+    key = hashlib.sha256(
+        f"{source.resolve()}:{modified}:{mask_color.lower()}".encode()
+    ).hexdigest()
+    target = directory / f"{key}.gif"
+    if target.is_file():
+        _prune_gif_preview_cache(directory, target)
+        return target
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / f".{key}.tmp.gif"
+    try:
+        subprocess.run(
+            [
+                "magick",
+                str(source),
+                "-coalesce",
+                "-colorspace",
+                "gray",
+                "+level-colors",
+                f"#000000,{mask_color}",
+                "-layers",
+                "Optimize",
+                str(temporary),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        temporary.replace(target)
+        _prune_gif_preview_cache(directory, target)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        temporary.unlink(missing_ok=True)
+        raise HidError(f"unable to render masked GIF preview {source}: {exc}") from exc
+    return target
+
+
+def _prune_gif_preview_cache(directory: Path, current: Path) -> None:
+    """Bound generated previews while retaining the preview currently in use."""
+    previews = sorted(
+        (
+            preview
+            for preview in directory.glob("*.gif")
+            if preview != current
+        ),
+        key=lambda preview: preview.stat().st_mtime_ns,
+        reverse=True,
+    )
+    for obsolete in previews[GIF_PREVIEW_CACHE_LIMIT - 1 :]:
+        obsolete.unlink(missing_ok=True)
+
+
+def _render_static_background(input_args: list[str], description: object) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".mp4") as output:
+        try:
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    *input_args,
+                    "-t",
+                    "30",
+                    "-vf",
+                    (
+                        "scale=320:320:force_original_aspect_ratio=increase,"
+                        "crop=320:320"
+                    ),
+                    "-r",
+                    "20",
+                    "-c:v",
+                    "libx264",
+                    "-profile:v",
+                    "high",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-b:v",
+                    "675k",
+                    "-minrate",
+                    "675k",
+                    "-maxrate",
+                    "675k",
+                    "-bufsize",
+                    "675k",
+                    "-movflags",
+                    "+faststart",
+                    output.name,
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise HidError(f"unable to render {description}: {exc}") from exc
         return Path(output.name).read_bytes()
 
 

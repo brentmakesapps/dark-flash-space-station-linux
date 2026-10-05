@@ -36,8 +36,33 @@ class Widget:
     width: int = 120
     height: int = 60
     history_seconds: int = 60
+    gpu_bdf: str = ""
+    temperature_unit: str = ""
+    color_source: str = "manual"
+    color_hue_shift: float = 0
+    color_brightness_percent: float = 100
 
     def __post_init__(self) -> None:
+        if self.color_source not in {"manual", "openrgb"}:
+            self.color_source = "manual"
+        if (
+            not isinstance(self.color_hue_shift, (int, float))
+            or isinstance(self.color_hue_shift, bool)
+            or not math.isfinite(self.color_hue_shift)
+        ):
+            self.color_hue_shift = 0
+        self.color_hue_shift = min(180, max(-180, self.color_hue_shift))
+        if (
+            not isinstance(self.color_brightness_percent, (int, float))
+            or isinstance(self.color_brightness_percent, bool)
+            or not math.isfinite(self.color_brightness_percent)
+        ):
+            self.color_brightness_percent = 100
+        self.color_brightness_percent = min(
+            200, max(25, self.color_brightness_percent)
+        )
+        if self.temperature_unit not in {"", "C", "F"}:
+            self.temperature_unit = ""
         if self.is_circular_graph:
             side = max(MIN_GRAPH_SIZE, self.width, self.height)
             self.width = side
@@ -55,6 +80,27 @@ class Widget:
 class Layout:
     name: str
     widgets: list[Widget] = field(default_factory=list)
+    media: LayoutMedia = field(default_factory=lambda: LayoutMedia())
+
+
+@dataclass
+class LayoutMedia:
+    kind: str = "inherit"
+    file: str = ""
+    gif_mask_mode: str = "none"
+    gif_mask_color: str = "#ffffff"
+    gif_speed_source: str = "none"
+    gif_speed_gpu_bdf: str = ""
+    gif_hue_shift: float = 0
+    gif_brightness_percent: float = 100
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"inherit", "none", "image", "gif"}:
+            self.kind = "none"
+        if self.gif_mask_mode not in {"none", "manual", "openrgb"}:
+            self.gif_mask_mode = "none"
+        if self.gif_speed_source not in {"none", "cpu", "gpu", "max"}:
+            self.gif_speed_source = "none"
 
 
 class LayoutDraft:
@@ -164,8 +210,23 @@ class LayoutStore:
             data = json.loads(self.path.read_text())
             if not isinstance(data, dict):
                 raise ValueError("layouts must be a JSON object")
-            layouts = {
-                name: Layout(
+            layouts = {}
+            for name, saved_layout in data.items():
+                if not isinstance(name, str):
+                    continue
+                widgets = (
+                    saved_layout
+                    if isinstance(saved_layout, list)
+                    else saved_layout.get("widgets", [])
+                    if isinstance(saved_layout, dict)
+                    else []
+                )
+                media_data = (
+                    saved_layout.get("media", {})
+                    if isinstance(saved_layout, dict)
+                    else {}
+                )
+                layouts[name] = Layout(
                     name,
                     [
                         Widget(
@@ -178,10 +239,16 @@ class LayoutStore:
                         for item in widgets
                         if isinstance(item, dict)
                     ],
+                    LayoutMedia(
+                        **{
+                            key: value
+                            for key, value in media_data.items()
+                            if key in LayoutMedia.__dataclass_fields__
+                        }
+                    )
+                    if isinstance(media_data, dict)
+                    else LayoutMedia(),
                 )
-                for name, widgets in data.items()
-                if isinstance(name, str) and isinstance(widgets, list)
-            }
             if layouts:
                 return layouts
         except (OSError, ValueError, TypeError, AttributeError):
@@ -191,7 +258,19 @@ class LayoutStore:
 
     def save(self, layouts: dict[str, Layout]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps({name: [asdict(widget) for widget in layout.widgets] for name, layout in layouts.items()}, indent=2) + "\n")
+        self.path.write_text(
+            json.dumps(
+                {
+                    name: {
+                        "widgets": [asdict(widget) for widget in layout.widgets],
+                        "media": asdict(layout.media),
+                    }
+                    for name, layout in layouts.items()
+                },
+                indent=2,
+            )
+            + "\n"
+        )
 
     def active_name(self, layouts: dict[str, Layout] | None = None) -> str:
         """Return the persisted active layout, falling back compatibly."""
