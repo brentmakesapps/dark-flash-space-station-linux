@@ -7,6 +7,7 @@ import json
 import subprocess
 from pathlib import Path
 
+from .api import ApiServer, DEFAULT_PORT, LOOPBACK
 from .animation import AdaptiveAnimation, AnimationCache
 from .controller import SpaceStation
 from .hid import HidError
@@ -15,11 +16,20 @@ from .media import render_background_image, render_blank_background
 from .openrgb import gif_mask_color
 from .settings import AppSettings, SettingsStore
 from .service import (
+    api_service_status,
+    install_api_service,
     install_service,
     service_status,
+    start_api_service,
     start_service,
+    stop_api_service,
     stop_service,
 )
+
+def restart_display_service() -> None:
+    """Restart the always-on overlay so it picks up the newly active layout."""
+    stop_service()
+    start_service()
 
 def restore_saved_animation(
     controller: SpaceStation, store: SettingsStore, settings: AppSettings
@@ -127,6 +137,39 @@ def _parser() -> argparse.ArgumentParser:
     ):
         service_commands.add_parser(name, help=help_text)
 
+    api_parser = commands.add_parser(
+        "api",
+        help="Home Assistant integration HTTP API for layout control",
+        description="Home Assistant integration HTTP API for layout control.",
+    )
+    api_common = argparse.ArgumentParser(add_help=False)
+    api_common.add_argument("--port", type=int, default=DEFAULT_PORT, help="listen port")
+    api_common.add_argument(
+        "--bind",
+        default=LOOPBACK,
+        help="listen address; a token is required for non-loopback addresses",
+    )
+    api_common.add_argument(
+        "--token", help="bearer token required by Home Assistant requests"
+    )
+    api_common.add_argument(
+        "--gpu-bdf", help="GPU BDF for telemetry (default: saved GUI preference)"
+    )
+
+    api_commands = api_parser.add_subparsers(dest="api_command", required=True)
+    api_commands.add_parser(
+        "serve", parents=[api_common], help="run the API server in the foreground"
+    )
+    api_commands.add_parser(
+        "install", parents=[api_common], help="install/update the API user unit"
+    )
+    for name, help_text in (
+        ("start", "enable and start the API service"),
+        ("stop", "stop the API service"),
+        ("status", "show API service status"),
+    ):
+        api_commands.add_parser(name, parents=[api_common], help=help_text)
+
     commands.add_parser("gui", help="open the GTK 4 / Libadwaita controller")
     return parser
 
@@ -216,6 +259,31 @@ def main() -> None:
                 stop_service()
             else:
                 print(service_status())
+        elif args.command == "api":
+            if args.api_command == "serve":
+                server = ApiServer(
+                    host=args.bind,
+                    port=args.port,
+                    token=args.token,
+                    gpu_bdf=args.gpu_bdf,
+                    apply_callback=restart_display_service,
+                )
+                print(
+                    f"API server listening on {server.host}:{server.port}",
+                    flush=True,
+                )
+                server.serve_forever()
+            elif args.api_command == "install":
+                print(
+                    f"Installed "
+                    f"{install_api_service(args.port, args.bind, args.token, args.gpu_bdf)}"
+                )
+            elif args.api_command == "start":
+                start_api_service()
+            elif args.api_command == "stop":
+                stop_api_service()
+            else:
+                print(api_service_status())
         else:
             from .gui import main as gui_main
 

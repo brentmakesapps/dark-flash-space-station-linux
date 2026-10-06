@@ -24,6 +24,8 @@ DarkFlash.
 - A visual telemetry-layout editor with text widgets and six graph styles.
 - Optional GIF color masking and synchronization with an OpenRGB LED.
 - A managed user service for a persistent telemetry overlay.
+- A local HTTP API for Home Assistant automations that select layouts and read
+  telemetry.
 
 The firmware has separate background-video and foreground-OSD layers. A GIF
 upload always sends the MP4 background followed by a transparent OSD. A still
@@ -123,6 +125,10 @@ darkflash-space-station telemetry --overlay --once
 darkflash-space-station telemetry --overlay --layout Gaming
 darkflash-space-station telemetry --overlay --temperature-unit F --once
 darkflash-space-station telemetry --gpu-bdf 0000:04:00.0 --interval 1
+
+# Serve the Home Assistant integration API, then select a saved layout.
+darkflash-space-station api serve --port 8790
+curl -X POST http://127.0.0.1:8790/api/layout -H 'Content-Type: application/json' -d '{"layout": "Gaming"}'
 ```
 
 Run `darkflash-space-station --help` or append `--help` to any subcommand for
@@ -307,6 +313,124 @@ The `service install` command writes a user unit containing the executable path
 of the Python environment that ran the command. Re-run it after moving or
 recreating the virtual environment.
 
+## Home Assistant integration
+
+The `api` command group serves a small HTTP API that Home Assistant automations
+can use to select a saved layout and read live telemetry. No extra Python
+packages are required. Applying a layout stores it as the active layout and
+restarts the display service, the same path the GUI uses, so the panel updates
+immediately.
+
+| Method | Path | Returns |
+| --- | --- | --- |
+| `GET` | `/` | Service name and endpoint list |
+| `GET` | `/api/state` | Active layout, saved layout names, and whether the display and API services are active |
+| `GET` | `/api/telemetry` | CPU, GPU, and network values in the stock-theme payload shape |
+| `POST` | `/api/layout` | `{"layout": "Night"}` — the name must already be saved; responds with the new state |
+
+Requests use a `Bearer` token. Loopback access needs no token; binding to any
+other address requires `--token`. Unknown layout names return `404`, a missing
+or malformed body returns `400`, and an unreadable telemetry source returns
+`502`.
+
+Enable the API as a systemd user service, which writes the unit and a
+token file at `~/.config/darkflash-space-station/api.env` (mode `0600`):
+
+```bash
+darkflash-space-station api install --bind 127.0.0.1 --port 8790 --token "$HA_TOKEN"
+darkflash-space-station api start
+darkflash-space-station api status
+darkflash-space-station api stop
+```
+
+To run it in the foreground instead, use `api serve` with the same options.
+
+### Home Assistant configuration
+
+Point the API at Home Assistant's address if it runs on another host, for
+example `--bind 0.0.0.0 --token "$HA_TOKEN"`. In Home Assistant:
+
+```yaml
+rest_command:
+  darkflash_layout:
+    url: http://127.0.0.1:8790/api/layout
+    method: POST
+    headers:
+      authorization: Bearer REPLACE_WITH_TOKEN
+      content-type: application/json
+    payload: '{"layout": "{{ layout }}"}'
+
+sensor:
+  - platform: rest
+    name: Space Station active layout
+    unique_id: darkflash_active_layout
+    resource: http://127.0.0.1:8790/api/state
+    headers:
+      authorization: Bearer REPLACE_WITH_TOKEN
+    value_template: "{{ value_json.active_layout }}"
+
+  - platform: rest
+    name: Space Station CPU load
+    unique_id: darkflash_cpu_load
+    resource: http://127.0.0.1:8790/api/telemetry
+    headers:
+      authorization: Bearer REPLACE_WITH_TOKEN
+    value_template: "{{ value_json.cpu.load }}"
+    unit_of_measurement: "%"
+    state_class: measurement
+
+  - platform: rest
+    name: Space Station GPU load
+    unique_id: darkflash_gpu_load
+    resource: http://127.0.0.1:8790/api/telemetry
+    headers:
+      authorization: Bearer REPLACE_WITH_TOKEN
+    value_template: "{{ value_json.gpu.load }}"
+    unit_of_measurement: "%"
+    state_class: measurement
+
+  - platform: rest
+    name: Space Station GPU temperature
+    unique_id: darkflash_gpu_temperature
+    resource: http://127.0.0.1:8790/api/telemetry
+    headers:
+      authorization: Bearer REPLACE_WITH_TOKEN
+    value_template: "{{ value_json.gpu.temperature }}"
+    unit_of_measurement: "°C"
+```
+
+Each sensor polls its endpoint every 30 seconds by default; set `scan_interval` for faster updates. Replace `REPLACE_WITH_TOKEN` with the same value passed to `api install --token`.
+
+Select a layout on a schedule:
+
+```yaml
+automation:
+  - name: Space Station night layout
+    trigger:
+      - platform: time
+        at: "21:00:00"
+    action:
+      - service: rest_command.darkflash_layout
+        data:
+          layout: Night
+
+  - name: Space Station gaming layout
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.space_station_gpu_load
+        above: 80
+        for: "00:05:00"
+    action:
+      - service: rest_command.darkflash_layout
+        data:
+          layout: Gaming
+```
+
+Layout names must match names saved in the GUI or `layouts.json`; the API only
+selects existing layouts, it does not create them. Layout changes restart
+the display service, so a layout switch cannot run at the same moment as a
+manual media write — see the one-writer rule above.
+
 ## Troubleshooting
 
 | Symptom | Action |
@@ -343,7 +467,8 @@ be verified on the target cooler.
 | `src/darkflash_space_station/layout.py` | Saved telemetry layout model |
 | `src/darkflash_space_station/gui.py` | GTK 4 / Libadwaita application |
 | `src/darkflash_space_station/service.py` | Managed systemd user-service integration |
-| `tests/` | Protocol and CLI tests |
+| `src/darkflash_space_station/api.py` | Home Assistant integration HTTP API |
+| `tests/` | Protocol, CLI, and API tests |
 
 ## License
 
